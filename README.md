@@ -45,10 +45,6 @@ the module; you do not install them by hand.
 AUAE is not published to the Slicer Extensions Manager store. You install it directly from
 this repository.
 
-> [!NOTE]
-> The commands below use `https://github.com/pietro98vr/SlicerAUAE`. Replace it with your own
-> repository if it differs.
-
 ### 1. Install 3D Slicer 5.10
 
 Download and install Slicer 5.10 from https://download.slicer.org, then open it.
