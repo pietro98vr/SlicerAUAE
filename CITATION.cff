@@ -1,0 +1,56 @@
+cff-version: 1.2.0
+message: >-
+  This project is based on SlicerUpperAirwaySegmentator. If you use it, please cite the
+  upstream paper and nnU-Net (see references).
+title: "Automatic Upper Airways Extension (AUAE)"
+authors:
+  - family-names: Montagna
+    given-names: Pietro
+    email: pietro.montagna@univr.it
+    affiliation: "Head and Neck Department, Department of Surgery, Dentistry, Pediatrics and Gynecology, University of Verona, Verona, Italy"
+  - family-names: Lonardi
+    given-names: Fabio
+    email: fabio.lonardi@univr.it
+    affiliation: "Head and Neck Department, Department of Surgery, Dentistry, Pediatrics and Gynecology, University of Verona, Verona, Italy"
+repository-code: "https://github.com/pietro98vr/SlicerAUAE"
+license: Apache-2.0
+type: software
+references:
+  - type: article
+    title: "Segmentation of the Upper Airway using Deep learning - nnUNet"
+    authors:
+      - family-names: Gianoni-Capenakas
+        given-names: Silvia
+      - family-names: Matos
+        given-names: Alejandro
+      - family-names: Dot
+        given-names: Gauthier
+      - family-names: Schouman
+        given-names: Thomas
+      - family-names: Chaurasia
+        given-names: Akhilanand
+      - family-names: Pliska
+        given-names: Benjamin
+      - family-names: Lagravere
+        given-names: Manuel
+      - family-names: Panithakumar
+        given-names: Kumaradevan
+    journal: "Journal of Dentistry"
+    year: 2026
+    doi: "10.1016/j.jdent.2026.106507"
+  - type: article
+    title: "nnU-Net: a self-configuring method for deep learning-based biomedical image segmentation"
+    authors:
+      - family-names: Isensee
+        given-names: Fabian
+      - family-names: Jaeger
+        given-names: Paul F.
+      - family-names: Kohl
+        given-names: Simon A. A.
+      - family-names: Petersen
+        given-names: Jens
+      - family-names: Maier-Hein
+        given-names: Klaus H.
+    journal: "Nature Methods"
+    year: 2021
+    doi: "10.1038/s41592-020-01008-z"

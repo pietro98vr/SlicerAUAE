@@ -1,0 +1,6 @@
+# Python packages used by this project inside Slicer's Python environment.
+# torch and nnunetv2 are installed by the NNUNet Slicer extension (SlicerNNUNetLib) or by
+# the project's "CUDA / PyTorch setup" section, so they are intentionally NOT pinned here.
+PyGithub          # upstream weight download (github API)
+scipy             # island cleanup + airway extension
+light-the-torch   # optional: CUDA-aware torch install helper

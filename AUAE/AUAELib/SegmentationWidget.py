@@ -1,0 +1,673 @@
+"""Main module widget.
+
+This is based on capenaka/SlicerUpperAirwaySegmentator. The upstream automatic nnU-Net
+segmentation core (input selection, weight download, inference through SlicerNNUNetLib) and
+the multi-format export (STL/OBJ/NIFTI) are kept as-is. The changes are:
+
+  * the embedded Segment Editor (qMRMLSegmentEditorWidget) and its surface-smoothing slider
+    are removed; island cleanup is done in NumPy instead (see AirwayExtension);
+  * segmentation and airway extension are two separate steps: "Apply" segments and cleans the
+    mask, then "Run airway extension" extends the selected segmentation, so the user can
+    refine the segmentation in between;
+  * a "Batch processing" section runs a JSON-defined list of volumes into per-volume output
+    subfolders;
+  * a "Dependencies & CUDA" section reports required-vs-installed versions and installs
+    everything needed the Slicer-compliant way (via the NNUNet + PyTorch extensions).
+"""
+
+import os
+from enum import Flag, auto
+from pathlib import Path
+
+import ctk
+import qt
+import slicer
+
+from . import AirwayExtension
+from . import Dependencies
+from . import BatchProcessor as BatchProcessorLib
+from .IconPath import icon, iconPath
+from .PythonDependencyChecker import PythonDependencyChecker
+from .Utils import (
+    createButton,
+    addInCollapsibleLayout,
+    set3DViewBackgroundColors,
+    setConventionalWideScreenView,
+    setBoxAndTextVisibilityOnThreeDViews,
+)
+
+
+class ExportFormat(Flag):
+    STL = auto()
+    OBJ = auto()
+    NIFTI = auto()
+
+
+class SegmentationWidget(qt.QWidget):
+    def __init__(self, logic=None, parent=None):
+        super().__init__(parent)
+        self.logic = logic or self._createSlicerSegmentationLogic()
+        self._prevSegmentationNode = None
+
+        self.inputSelector = slicer.qMRMLNodeComboBox(self)
+        self.inputSelector.nodeTypes = ["vtkMRMLScalarVolumeNode"]
+        self.inputSelector.addEnabled = False
+        self.inputSelector.showHidden = False
+        self.inputSelector.removeEnabled = False
+        self.inputSelector.setMRMLScene(slicer.mrmlScene)
+        self.inputSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.onInputChanged)
+
+        # Segmentation node selector. addEnabled=True restores the "Create new segmentation"
+        # entry, so the user can pick or create the node to segment, refine, and extend.
+        self.segmentationNodeSelector = slicer.qMRMLNodeComboBox(self)
+        self.segmentationNodeSelector.nodeTypes = ["vtkMRMLSegmentationNode"]
+        self.segmentationNodeSelector.selectNodeUponCreation = True
+        self.segmentationNodeSelector.addEnabled = True
+        self.segmentationNodeSelector.removeEnabled = True
+        self.segmentationNodeSelector.renameEnabled = True
+        self.segmentationNodeSelector.showHidden = False
+        self.segmentationNodeSelector.setMRMLScene(slicer.mrmlScene)
+        self.segmentationNodeSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.updateSegmentationSelection)
+
+        layout = qt.QVBoxLayout(self)
+        layout.addWidget(self.inputSelector)
+        layout.addWidget(self.segmentationNodeSelector)
+
+        self.applyButton = createButton(
+            "Apply",
+            callback=self.onApplyClicked,
+            toolTip="Segment the selected volume and clean the mask (step 1).",
+            icon=icon("start_icon.png"),
+        )
+
+        self.currentInfoTextEdit = qt.QTextEdit()
+        self.currentInfoTextEdit.setReadOnly(True)
+        self.currentInfoTextEdit.setLineWrapMode(qt.QTextEdit.NoWrap)
+        self.fullInfoLogs = []
+
+        self.stopButton = createButton("Stop", callback=self.onStopClicked, toolTip="Click to Stop the segmentation.")
+        self.stopWidget = qt.QWidget(self)
+        stopLayout = qt.QVBoxLayout(self.stopWidget)
+        stopLayout.setContentsMargins(0, 0, 0, 0)
+        stopLayout.addWidget(self.stopButton)
+        stopLayout.addWidget(self.currentInfoTextEdit)
+        self.stopWidget.setVisible(False)
+        self.loading = qt.QMovie(iconPath("loading.gif"))
+        self.loading.setScaledSize(qt.QSize(24, 24))
+        self.loading.frameChanged.connect(self._updateStopIcon)
+        self.loading.start()
+
+        self.applyWidget = qt.QWidget(self)
+        applyLayout = qt.QHBoxLayout(self.applyWidget)
+        applyLayout.setContentsMargins(0, 0, 0, 0)
+        applyLayout.addWidget(self.applyButton, 1)
+        applyLayout.addWidget(
+            createButton("", callback=self.showInfoLogs, icon=icon("info.png"), toolTip="Show logs.")
+        )
+
+        layout.addWidget(self.applyWidget)
+        layout.addWidget(self.stopWidget)
+
+        addInCollapsibleLayout(self._createPostprocessWidget(), layout, "Post-processing", isCollapsed=False)
+        addInCollapsibleLayout(self._createExtensionWidget(), layout, "Airway extension", isCollapsed=False)
+
+        exportWidget = self._createExportWidget()
+        addInCollapsibleLayout(exportWidget, layout, "Export segmentation", isCollapsed=False)
+
+        addInCollapsibleLayout(self._createBatchWidget(), layout, "Batch processing", isCollapsed=True)
+        addInCollapsibleLayout(self._createDependenciesWidget(), layout, "Dependencies && CUDA", isCollapsed=True)
+
+        layout.addStretch()
+
+        self.isStopping = False
+        self._dependencyChecker = PythonDependencyChecker()
+        self.processedVolumes = {}
+
+        self.onInputChanged()
+        self.updateSegmentationSelection()
+        self.sceneCloseObserver = slicer.mrmlScene.AddObserver(slicer.mrmlScene.EndCloseEvent, self.onSceneChanged)
+        self.onSceneChanged(doStopInference=False)
+        self._connectSegmentationLogic()
+
+    # ------------------------------------------------------------------ UI builders ---
+    def _createPostprocessWidget(self):
+        # Island cleanup, applied during the segmentation step. The two options are mutually
+        # exclusive (both may be off = no cleanup). Replaces the upstream "Islands" effect.
+        widget = qt.QWidget()
+        form = qt.QFormLayout(widget)
+        self.removeIslandsCheckBox = qt.QCheckBox(widget)
+        self.removeIslandsCheckBox.setChecked(True)
+        self.removeIslandsCheckBox.setToolTip("Remove small disconnected components below a physical-volume threshold.")
+        self.removeIslandsCheckBox.toggled.connect(self._onRemoveIslandsToggled)
+        form.addRow("Remove small islands", self.removeIslandsCheckBox)
+
+        self.keepLargestCheckBox = qt.QCheckBox(widget)
+        self.keepLargestCheckBox.setChecked(False)
+        self.keepLargestCheckBox.setToolTip("Keep only the single largest connected component. Mutually exclusive with 'Remove small islands'.")
+        self.keepLargestCheckBox.toggled.connect(self._onKeepLargestToggled)
+        form.addRow("Keep largest island only", self.keepLargestCheckBox)
+        return widget
+
+    def _createExtensionWidget(self):
+        # Step 2, decoupled from segmentation: extends the currently selected segmentation
+        # for flow modelling, so the user can refine the mask first, then extend it.
+        widget = qt.QWidget()
+        form = qt.QFormLayout(widget)
+
+        self.extendDirectionComboBox = qt.QComboBox(widget)
+        for direction in AirwayExtension.EXTENSION_DIRECTIONS:
+            self.extendDirectionComboBox.addItem(direction)
+        self.extendDirectionComboBox.setToolTip("Direction in which to extend the airway beyond the field of view.")
+        form.addRow("Direction", self.extendDirectionComboBox)
+
+        self.extendLengthSpinBox = ctk.ctkDoubleSpinBox(widget)
+        self.extendLengthSpinBox.minimum = 0.0
+        self.extendLengthSpinBox.maximum = 300.0
+        self.extendLengthSpinBox.singleStep = 5.0
+        self.extendLengthSpinBox.value = 100.0
+        self.extendLengthSpinBox.suffix = " mm"
+        form.addRow("Length", self.extendLengthSpinBox)
+
+        form.addRow(createButton(
+            "Run airway extension", callback=self.onRunExtensionClicked, parent=widget,
+            toolTip="Extend the selected segmentation by repeating its terminal slice (step 2)."
+        ))
+        return widget
+
+    def _createExportWidget(self):
+        exportWidget = qt.QWidget()
+        exportLayout = qt.QFormLayout(exportWidget)
+        self.stlCheckBox = qt.QCheckBox(exportWidget)
+        self.stlCheckBox.setChecked(True)
+        self.objCheckBox = qt.QCheckBox(exportWidget)
+        self.niftiCheckBox = qt.QCheckBox(exportWidget)
+        self.niftiCheckBox.setChecked(True)
+        exportLayout.addRow("Export STL", self.stlCheckBox)
+        exportLayout.addRow("Export OBJ", self.objCheckBox)
+        exportLayout.addRow("Export NIFTI", self.niftiCheckBox)
+        exportLayout.addRow(createButton("Export", callback=self.onExportClicked, parent=exportWidget))
+        return exportWidget
+
+    def _createBatchWidget(self):
+        widget = qt.QWidget()
+        form = qt.QFormLayout(widget)
+        self.batchTemplateLineEdit = qt.QLineEdit(widget)
+        self.batchTemplateLineEdit.text = str(BatchProcessorLib.defaultTemplatePath())
+        self.batchTemplateLineEdit.setToolTip("JSON template listing the volumes to process, in order.")
+        browseRow = qt.QHBoxLayout()
+        browseRow.addWidget(self.batchTemplateLineEdit, 1)
+        browseRow.addWidget(createButton("Browse...", callback=self.onBrowseTemplate, parent=widget))
+        browseRow.addWidget(createButton("Open folder", callback=self.onOpenTemplateFolder, parent=widget))
+        rowWidget = qt.QWidget(widget)
+        rowWidget.setLayout(browseRow)
+        form.addRow("Template JSON", rowWidget)
+        form.addRow(createButton(
+            "Run batch", callback=self.onRunBatchClicked, parent=widget,
+            toolTip="Segment and export every volume listed in the template into per-volume subfolders."
+        ))
+        return widget
+
+    def _createDependenciesWidget(self):
+        widget = qt.QWidget()
+        form = qt.QFormLayout(widget)
+        self.deviceComboBox = qt.QComboBox(widget)
+        for device in ("Auto", "CUDA", "CPU"):
+            self.deviceComboBox.addItem(device)
+        self.deviceComboBox.setToolTip("Inference device. 'Auto' uses CUDA when available, else CPU.")
+        form.addRow("Inference device", self.deviceComboBox)
+        buttons = qt.QHBoxLayout()
+        buttons.addWidget(createButton("Check dependencies", callback=self.onCheckDependenciesClicked, parent=widget))
+        buttons.addWidget(createButton("Install / update dependencies", callback=self.onInstallDependenciesClicked, parent=widget))
+        rowWidget = qt.QWidget(widget)
+        rowWidget.setLayout(buttons)
+        form.addRow(rowWidget)
+        return widget
+
+    # ------------------------------------------------------------------ lifecycle -----
+    def __del__(self):
+        slicer.mrmlScene.RemoveObserver(self.sceneCloseObserver)
+        super().__del__()
+
+    def onSceneChanged(self, *_, doStopInference=True):
+        if doStopInference:
+            self.onStopClicked()
+        self.processedVolumes = {}
+        self._prevSegmentationNode = None
+        self._initSlicerDisplay()
+
+    @staticmethod
+    def _initSlicerDisplay():
+        """Initialize Slicer's display with a white background and no 3D box / labels."""
+        set3DViewBackgroundColors([1, 1, 1], [1, 1, 1])
+        setConventionalWideScreenView()
+        setBoxAndTextVisibilityOnThreeDViews(False)
+
+    def _updateStopIcon(self):
+        self.stopButton.setIcon(qt.QIcon(self.loading.currentPixmap()))
+
+    def onStopClicked(self):
+        """Stop the running inference and restore the buttons once cleanup is done."""
+        self.isStopping = True
+        if self.logic is not None:
+            self.logic.stopSegmentation()
+            self.logic.waitForSegmentationFinished()
+        slicer.app.processEvents()
+        self.isStopping = False
+        self._setApplyVisible(True)
+
+    def onApplyClicked(self, *_):
+        self.currentInfoTextEdit.clear()
+        self._setApplyVisible(False)
+        if not self._ensureReadyToRun():
+            self._setApplyVisible(True)
+            return
+        if not self._dependencyChecker.downloadWeightsIfNeeded(self.onProgressInfo):
+            self._setApplyVisible(True)
+            return
+        self._runSegmentation()
+
+    def _setApplyVisible(self, isVisible):
+        self.applyWidget.setVisible(isVisible)
+        self.stopWidget.setVisible(not isVisible)
+        self.inputSelector.setEnabled(isVisible)
+        self.segmentationNodeSelector.setEnabled(isVisible)
+
+    def _ensureReadyToRun(self):
+        """Autonomous preflight: install/validate dependencies, then make the logic available."""
+        ok, needsRestart = Dependencies.ensure(self.onProgressInfo, askConfirmation=True)
+        if needsRestart:
+            slicer.util.infoDisplay("The PyTorch extension was installed. Please restart 3D Slicer, then run again.")
+            return False
+        if not ok:
+            slicer.util.errorDisplay(
+                "Dependencies are not ready. Open 'Dependencies && CUDA' and click "
+                "'Install / update dependencies', or check the log."
+            )
+            return False
+        if self.logic is None and self.isNNUNetModuleInstalled():
+            self.logic = self._createSlicerSegmentationLogic()
+            self._connectSegmentationLogic()
+        if self.logic is None:
+            slicer.util.errorDisplay("The NNUNet extension is required. Install it and restart Slicer.")
+            return False
+        return True
+
+    def _makeParameter(self):
+        """Build an nnU-Net Parameter with the selected device, falling back if unsupported."""
+        from SlicerNNUNetLib import Parameter
+        kwargs = dict(folds="0", modelPath=self.nnUnetFolder())
+        kwargs.update(Dependencies.parameterDeviceKwargs(self.deviceComboBox.currentText))
+        try:
+            return Parameter(**kwargs)
+        except TypeError:
+            return Parameter(folds="0", modelPath=self.nnUnetFolder())
+
+    def _runSegmentation(self):
+        deviceChoice = self.deviceComboBox.currentText.strip().lower()
+        cudaAvailable = Dependencies.torchStatus().get("cudaAvailable", False)
+        if deviceChoice != "cpu" and not cudaAvailable:
+            ret = qt.QMessageBox.question(
+                self,
+                "CUDA not available",
+                "CUDA is not currently available on your system.\n"
+                "Running the segmentation may take up to 1 hour on CPU.\n"
+                "You can install a CUDA build from 'Dependencies && CUDA'.\n"
+                "Would you like to proceed on CPU?",
+            )
+            if ret == qt.QMessageBox.No:
+                self._setApplyVisible(True)
+                return
+
+        slicer.app.processEvents()
+        self.logic.setParameter(self._makeParameter())
+        self.logic.startSegmentation(self.getCurrentVolumeNode())
+
+    def onInputChanged(self, *_):
+        volumeNode = self.getCurrentVolumeNode()
+        self.applyButton.setEnabled(volumeNode is not None)
+        slicer.util.setSliceViewerLayers(background=volumeNode)
+        slicer.util.resetSliceViews()
+        self._restoreProcessedSegmentation()
+
+    def _restoreProcessedSegmentation(self):
+        segmentationNode = self.processedVolumes.get(self.getCurrentVolumeNode())
+        self.segmentationNodeSelector.setCurrentNode(segmentationNode)
+
+    def _storeProcessedSegmentation(self):
+        volumeNode = self.getCurrentVolumeNode()
+        segmentationNode = self.getCurrentSegmentationNode()
+        if volumeNode and segmentationNode:
+            self.processedVolumes[volumeNode] = segmentationNode
+
+    def updateSegmentationSelection(self, *_):
+        """Toggle display of the selected segmentation (no segment editor involved)."""
+        if self._prevSegmentationNode:
+            self._prevSegmentationNode.SetDisplayVisibility(False)
+        segmentationNode = self.getCurrentSegmentationNode()
+        self._prevSegmentationNode = segmentationNode
+        self._initializeSegmentationNodeDisplay(segmentationNode)
+
+    def _initializeSegmentationNodeDisplay(self, segmentationNode):
+        if not segmentationNode:
+            return
+        segmentationNode.SetReferenceImageGeometryParameterFromVolumeNode(self.getCurrentVolumeNode())
+        if not segmentationNode.GetDisplayNode():
+            segmentationNode.CreateDefaultDisplayNodes()
+            slicer.app.processEvents()
+        segmentationNode.SetDisplayVisibility(True)
+        layoutManager = slicer.app.layoutManager()
+        threeDWidget = layoutManager.threeDWidget(0)
+        threeDWidget.threeDView().rotateToViewAxis(3)
+        slicer.util.resetThreeDViews()
+
+    def getCurrentVolumeNode(self):
+        return self.inputSelector.currentNode()
+
+    def getCurrentSegmentationNode(self):
+        return self.segmentationNodeSelector.currentNode()
+
+    def onInferenceFinished(self, *_):
+        if self.isStopping:
+            self._setApplyVisible(True)
+            return
+        try:
+            self.onProgressInfo("Loading inference results...")
+            self._loadSegmentationResults()
+            self.onProgressInfo("Segmentation ended successfully. Refine it if needed, then run the airway extension.")
+        except RuntimeError as e:
+            slicer.util.errorDisplay(e)
+            self.onProgressInfo("Error loading results :\n" + str(e))
+        finally:
+            self._setApplyVisible(True)
+
+    def _loadSegmentationResults(self):
+        """Load the nnU-Net result and run island cleanup only (extension is a separate step)."""
+        rawSegmentation = self.logic.loadSegmentation()
+        rawSegmentation.SetName(self.getCurrentVolumeNode().GetName() + "_Segmentation")
+        segmentationNode = AirwayExtension.postprocessSegmentation(
+            rawSegmentation, self.getCurrentVolumeNode(), self._collectPostprocessOptions(), self.onProgressInfo
+        )
+        slicer.mrmlScene.RemoveNode(rawSegmentation)
+
+        currentSegmentation = self.getCurrentSegmentationNode()
+        if currentSegmentation is not None and currentSegmentation is not segmentationNode:
+            self._copySegmentationResultsToExistingNode(currentSegmentation, segmentationNode)
+        else:
+            self.segmentationNodeSelector.setCurrentNode(segmentationNode)
+        slicer.app.processEvents()
+        self._updateSegmentationDisplay()
+        self._storeProcessedSegmentation()
+
+    def _collectPostprocessOptions(self):
+        options = AirwayExtension.defaultOptions()
+        options["removeSmallIslands"] = bool(self.removeIslandsCheckBox.checked)
+        options["keepLargestIsland"] = bool(self.keepLargestCheckBox.checked)
+        options["extend"] = False  # extension is an explicit, separate step
+        return options
+
+    def _collectExtensionOptions(self):
+        return {
+            "direction": self.extendDirectionComboBox.currentText,
+            "lengthMm": float(self.extendLengthSpinBox.value),
+        }
+
+    @staticmethod
+    def _copySegmentationResultsToExistingNode(currentSegmentation, segmentationNode):
+        currentName = currentSegmentation.GetName()
+        currentSegmentation.Copy(segmentationNode)
+        currentSegmentation.SetName(currentName)
+        slicer.mrmlScene.RemoveNode(segmentationNode)
+
+    def _updateSegmentationDisplay(self):
+        segmentationNode = self.getCurrentSegmentationNode()
+        if not segmentationNode:
+            return
+        self._initializeSegmentationNodeDisplay(segmentationNode)
+        segmentationNode.GetSegmentation().SetConversionParameter("Smoothing factor", "0.0")
+        slicer.util.resetThreeDViews()
+
+    def onRunExtensionClicked(self):
+        """Step 2: extend the currently selected segmentation, in place."""
+        segmentationNode = self.getCurrentSegmentationNode()
+        if not segmentationNode:
+            slicer.util.warningDisplay("Select a segmentation to extend first.")
+            return
+        self.currentInfoTextEdit.clear()
+        try:
+            extended = AirwayExtension.extendSegmentation(
+                segmentationNode, self.getCurrentVolumeNode(), self._collectExtensionOptions(), self.onProgressInfo
+            )
+            self._copySegmentationResultsToExistingNode(segmentationNode, extended)
+            self._updateSegmentationDisplay()
+            slicer.util.infoDisplay("Airway extension applied to '" + segmentationNode.GetName() + "'.")
+        except Exception as exc:  # noqa: BLE001
+            slicer.util.errorDisplay("Airway extension failed:\n" + str(exc))
+
+    def onInferenceError(self, errorMsg):
+        if self.isStopping:
+            return
+        self._setApplyVisible(True)
+        slicer.util.errorDisplay("Encountered error during inference :\n" + errorMsg)
+
+    def onProgressInfo(self, infoMsg):
+        infoMsg = self.removeImageIOError(infoMsg)
+        self.currentInfoTextEdit.insertPlainText(infoMsg + "\n")
+        self.moveTextEditToEnd(self.currentInfoTextEdit)
+        self.insertDatedInfoLogs(infoMsg)
+        slicer.app.processEvents()
+
+    @staticmethod
+    def removeImageIOError(infoMsg):
+        return "\n".join([msg for msg in infoMsg.strip().splitlines() if "Error ImageIO factory" not in msg])
+
+    def insertDatedInfoLogs(self, infoMsg):
+        now = qt.QDateTime.currentDateTime().toString("yyyy/MM/dd hh:mm:ss.zzz")
+        self.fullInfoLogs.extend([now + " :: " + msgLine for msgLine in infoMsg.splitlines()])
+
+    def showInfoLogs(self):
+        dialog = qt.QDialog()
+        layout = qt.QVBoxLayout(dialog)
+        textEdit = qt.QTextEdit()
+        textEdit.setReadOnly(True)
+        textEdit.append("\n".join(self.fullInfoLogs))
+        textEdit.setLineWrapMode(qt.QTextEdit.NoWrap)
+        self.moveTextEditToEnd(textEdit)
+        layout.addWidget(textEdit)
+        dialog.setWindowFlags(qt.Qt.WindowCloseButtonHint)
+        dialog.resize(slicer.util.mainWindow().size * .7)
+        dialog.exec()
+
+    @staticmethod
+    def moveTextEditToEnd(textEdit):
+        textEdit.verticalScrollBar().setValue(textEdit.verticalScrollBar().maximum)
+
+    # ------------------------------------------------------------------ export --------
+    def getSelectedExportFormats(self):
+        selectedFormats = ExportFormat(0)
+        checkBoxes = {
+            self.objCheckBox: ExportFormat.OBJ,
+            self.stlCheckBox: ExportFormat.STL,
+            self.niftiCheckBox: ExportFormat.NIFTI,
+        }
+        for checkBox, exportFormat in checkBoxes.items():
+            if checkBox.isChecked():
+                selectedFormats |= exportFormat
+        return selectedFormats
+
+    def onExportClicked(self):
+        segmentationNode = self.getCurrentSegmentationNode()
+        if not segmentationNode:
+            slicer.util.warningDisplay("Please select a valid segmentation before exporting.")
+            return
+
+        selectedFormats = self.getSelectedExportFormats()
+        if selectedFormats == ExportFormat(0):
+            slicer.util.warningDisplay("Please select at least one export format before exporting.")
+            return
+
+        folderPath = qt.QFileDialog.getExistingDirectory(self, "Please select the export folder")
+        if not folderPath:
+            return
+
+        with slicer.util.tryWithErrorDisplay("Export to " + folderPath + " failed.", waitCursor=True):
+            self.exportSegmentation(segmentationNode, folderPath, selectedFormats)
+            slicer.util.infoDisplay("Export successful to " + folderPath + ".")
+
+    @staticmethod
+    def exportSegmentation(segmentationNode, folderPath, selectedFormats):
+        for closedSurfaceExport in [ExportFormat.STL, ExportFormat.OBJ]:
+            if selectedFormats & closedSurfaceExport:
+                slicer.vtkSlicerSegmentationsModuleLogic.ExportSegmentsClosedSurfaceRepresentationToFiles(
+                    folderPath,
+                    segmentationNode,
+                    None,
+                    closedSurfaceExport.name,
+                    True,
+                    1.0,
+                    False,
+                )
+
+        if selectedFormats & ExportFormat.NIFTI:
+            slicer.vtkSlicerSegmentationsModuleLogic.ExportSegmentsBinaryLabelmapRepresentationToFiles(
+                folderPath,
+                segmentationNode,
+                None,
+                "nii.gz",
+            )
+
+    # ------------------------------------------------------------------ post-processing
+    def _onRemoveIslandsToggled(self, checked):
+        if checked and self.keepLargestCheckBox.checked:
+            self.keepLargestCheckBox.setChecked(False)
+
+    def _onKeepLargestToggled(self, checked):
+        if checked and self.removeIslandsCheckBox.checked:
+            self.removeIslandsCheckBox.setChecked(False)
+
+    # ------------------------------------------------------------------ dependencies --
+    def onCheckDependenciesClicked(self):
+        self.currentInfoTextEdit.clear()
+        try:
+            ready = Dependencies.report(self.onProgressInfo)
+        except Exception as exc:  # noqa: BLE001
+            slicer.util.errorDisplay("Dependency check failed:\n" + str(exc))
+            return
+        if ready:
+            slicer.util.infoDisplay("All dependencies are present and the extension is ready to run.")
+        else:
+            slicer.util.warningDisplay(
+                "Some dependencies are missing. Click 'Install / update dependencies'. See the log for details."
+            )
+
+    def onInstallDependenciesClicked(self):
+        self.currentInfoTextEdit.clear()
+        self._setApplyVisible(False)
+        try:
+            ok, needsRestart = Dependencies.ensure(self.onProgressInfo, askConfirmation=True)
+            if needsRestart:
+                slicer.util.infoDisplay("The PyTorch extension was installed. Please restart 3D Slicer, then continue.")
+            elif ok:
+                slicer.util.infoDisplay("Dependencies installed/validated. Restart Slicer if torch was newly installed.")
+            else:
+                slicer.util.warningDisplay("Dependency setup did not fully complete. See the log.")
+        except Exception as exc:  # noqa: BLE001
+            slicer.util.errorDisplay("Dependency install failed:\n" + str(exc))
+        finally:
+            self._setApplyVisible(True)
+
+    # ------------------------------------------------------------------ batch ---
+    def onBrowseTemplate(self):
+        path = qt.QFileDialog.getOpenFileName(self, "Select batch template JSON", "", "JSON (*.json)")
+        if path:
+            self.batchTemplateLineEdit.text = path
+
+    def onOpenTemplateFolder(self):
+        folder = os.path.dirname(self.batchTemplateLineEdit.text) or str(BatchProcessorLib.defaultTemplatePath().parent)
+        qt.QDesktopServices.openUrl(qt.QUrl.fromLocalFile(folder))
+
+    def onRunBatchClicked(self):
+        templatePath = self.batchTemplateLineEdit.text.strip()
+        if not os.path.isfile(templatePath):
+            slicer.util.warningDisplay("Batch template not found: " + templatePath)
+            return
+
+        try:
+            config = BatchProcessorLib.loadConfig(templatePath)
+        except Exception as exc:  # noqa: BLE001
+            slicer.util.errorDisplay("Could not read batch template:\n" + str(exc))
+            return
+
+        if not config["volumes"]:
+            slicer.util.warningDisplay("The batch template lists no volumes.")
+            return
+
+        if not config["output_root"]:
+            folder = qt.QFileDialog.getExistingDirectory(self, "Select the batch output folder")
+            if not folder:
+                return
+            config["output_root"] = folder
+
+        self.currentInfoTextEdit.clear()
+        self._setApplyVisible(False)
+        try:
+            if not self._ensureReadyToRun():
+                return
+            if not self._dependencyChecker.downloadWeightsIfNeeded(self.onProgressInfo):
+                return
+
+            exportFormats = self._exportFormatFromNames(config["export_formats"])
+            deviceKwargs = Dependencies.parameterDeviceKwargs(self.deviceComboBox.currentText)
+            processor = BatchProcessorLib.BatchProcessor(
+                self.nnUnetFolder(), self.exportSegmentation, self.onProgressInfo
+            )
+            results = processor.run(config, exportFormats, deviceKwargs=deviceKwargs)
+        except Exception as exc:  # noqa: BLE001
+            slicer.util.errorDisplay("Batch processing failed:\n" + str(exc))
+            return
+        finally:
+            self._setApplyVisible(True)
+
+        ok = sum(1 for r in results if r["status"] == "ok")
+        failed = [r for r in results if r["status"] != "ok"]
+        message = "Batch complete: " + str(ok) + "/" + str(len(results)) + " volume(s) succeeded."
+        if failed:
+            lines = ["- " + os.path.basename(r["volume"]) + ": " + str(r["error"]) for r in failed]
+            message += "\nFailed:\n" + "\n".join(lines)
+        slicer.util.infoDisplay(message)
+
+    @staticmethod
+    def _exportFormatFromNames(names):
+        mapping = {"STL": ExportFormat.STL, "OBJ": ExportFormat.OBJ, "NIFTI": ExportFormat.NIFTI}
+        selected = ExportFormat(0)
+        for name in names:
+            fmt = mapping.get(str(name).strip().upper())
+            if fmt:
+                selected |= fmt
+        return selected if selected != ExportFormat(0) else (ExportFormat.STL | ExportFormat.NIFTI)
+
+    # ------------------------------------------------------------------ nnU-Net glue --
+    @staticmethod
+    def isNNUNetModuleInstalled():
+        try:
+            import SlicerNNUNetLib  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+    def _createSlicerSegmentationLogic(self):
+        if not self.isNNUNetModuleInstalled():
+            return None
+        from SlicerNNUNetLib import SegmentationLogic
+        return SegmentationLogic()
+
+    def _connectSegmentationLogic(self):
+        if self.logic is None:
+            return
+        self.logic.progressInfo.connect(self.onProgressInfo)
+        self.logic.errorOccurred.connect(self.onInferenceError)
+        self.logic.inferenceFinished.connect(self.onInferenceFinished)
+
+    @classmethod
+    def nnUnetFolder(cls):
+        fileDir = Path(__file__).parent
+        return fileDir.joinpath("..", "Resources", "ML").resolve()
