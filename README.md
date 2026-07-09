@@ -9,14 +9,14 @@ Automatic upper-airway segmentation on CT and CBCT in 3D Slicer, with mask exten
 </div>
 
 > [!IMPORTANT]
-> AUAE is based on the upstream project. The segmentation model and the method were created by the
-> upstream authors at the University of Alberta (Gianoni-Capenakas, Matos, Lagravere and
-> colleagues). If you use the segmentation, cite their paper (see [Citation](#citation)).
+> AUAE is based on a previous project,made by other authors (https://github.com/capenaka/SlicerUpperAirwaySegmentator). 
+> The segmentation model and the method were created by the
+> upstream authors. If you use the present  tool, cite their paper (see [Citation](#citation)).
 > AUAE adds tooling around that model; it does not replace or retrain it.
 
 ## What it does
 
-AUAE takes a CT or CBCT volume, runs the upstream nnU-Net model to segment the upper airway
+AUAE takes a CT or CBCT volume (HU calibrated), runs the upstream nnU-Net model to segment the upper airway
 (nasal cavity, nasopharynx, oropharynx), cleans the mask, and lets you export it as STL, OBJ,
 or NIFTI. On top of the upstream extension, AUAE adds four things:
 
@@ -27,16 +27,12 @@ or NIFTI. On top of the upstream extension, AUAE adds four things:
   subfolder per case, each with its segmentation and meshes.
 - **Two island-cleanup options** that cannot both be on: *remove small islands* or *keep the
   largest island only*.
-- **A dependency preflight** that installs and checks everything before a run, reports the
-  installed versions, and tells you whether inference will use the GPU or fall back to CPU.
-
-The upstream nnU-Net inference and the STL/OBJ/NIFTI export are used as-is. The embedded
-Segment Editor from the upstream UI is removed; the island cleanup that used it now runs in
-NumPy/SciPy.
+- **A dependency preflight and CUDA support** It installs and checks everything before run, reports the
+  installed versions, and tells whether inference will use the GPU or fall back to CPU.
 
 ## Requirements
 
-- 3D Slicer 5.10 (the guide below is written for it; 5.9 also works).
+- 3D Slicer 5.10 (the guide below is written for it).
 - The **NNUNet** Slicer extension, installed from the Extensions Manager. It also brings in
   the **PyTorch** extension, which supplies a torch build that matches your CUDA setup.
 - An NVIDIA GPU with a current driver for fast inference. CPU works but is slow.
@@ -47,8 +43,7 @@ the module; you do not install them by hand.
 ## Install and launch on Slicer 5.10
 
 AUAE is not published to the Slicer Extensions Manager store. You install it directly from
-this repository, which can be public or private (you only need access to clone or download
-it).
+this repository.
 
 > [!NOTE]
 > The commands below use `https://github.com/pietro98vr/SlicerAUAE`. Replace it with your own
@@ -107,14 +102,6 @@ restart. It runs the nnU-Net inference and pulls in the PyTorch extension.
 3. Click **Apply**. The model weights download the first time, then inference starts.
 4. When it finishes, export the airway from **Export segmentation**.
 
-### Releases
-
-GitHub attaches a source archive to every tagged release automatically. Download it,
-unzip it, and install it with the Extension Wizard or the module path (Methods A and B).
-A prebuilt `Install from file` package is not shipped: that format is produced by the
-Slicer extension factory when an extension is published to the Extensions Index, which this
-extension is not.
-
 ### Troubleshooting
 
 - **"This module depends on the NNUNet module":** install NNUNet from the Extensions Manager
@@ -150,13 +137,10 @@ Every field is described inside the template file.
 
 ## Credits
 
-Two groups of people are behind this extension, and the split matters.
-
 **The segmentation model and the upstream extension** are the work of Alejandro Matos
 Camarillo, Silvia Capenakas, and Manuel Lagravere at the University of Alberta, with the
 co-authors of the paper below. Their repository is
-[capenaka/SlicerUpperAirwaySegmentator](https://github.com/capenaka/SlicerUpperAirwaySegmentator),
-licensed under Apache-2.0.
+[capenaka/SlicerUpperAirwaySegmentator](https://github.com/capenaka/SlicerUpperAirwaySegmentator).
 
 **This project** (airway extension, batch processing, island options, dependency preflight) is
 by Dr. Pietro Montagna (DDS, MSc, PhD Student, pietro.montagna@univr.it) and Dr. Fabio
@@ -174,8 +158,6 @@ If this extension helps your work, cite the upstream paper and nnU-Net:
 > Isensee F, Jaeger PF, Kohl SAA, Petersen J, Maier-Hein KH. nnU-Net: a self-configuring
 > method for deep learning-based biomedical image segmentation. Nature Methods,
 > 2021;18(2):203-211. https://doi.org/10.1038/s41592-020-01008-z
-
-Machine-readable entries are in [`CITATION.cff`](CITATION.cff) and [`CITATION.bib`](CITATION.bib).
 
 ## License
 
