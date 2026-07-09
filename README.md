@@ -9,7 +9,7 @@ Automatic upper-airway segmentation on CT and CBCT in 3D Slicer, with mask exten
 </div>
 
 > [!IMPORTANT]
-> AUAE is based on a previous project,made by other authors (https://github.com/capenaka/SlicerUpperAirwaySegmentator). 
+> AUAE is based on a previous project, made by other authors and available at: (https://github.com/capenaka/SlicerUpperAirwaySegmentator). 
 > The segmentation model and the method were created by the
 > upstream authors. If you use the present  tool, cite their paper (see [Citation](#citation)).
 > AUAE adds tooling around that model; it does not replace or retrain it.
