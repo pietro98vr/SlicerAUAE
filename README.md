@@ -27,7 +27,7 @@ or NIFTI. On top of the upstream extension, AUAE adds four things:
   subfolder per case, each with its segmentation and meshes.
 - **Two island-cleanup options** that cannot both be on: *remove small islands* or *keep the
   largest island only*.
-- **Dependency preflight** It installs and checks everything before run, reports the
+- **Dependency preflight:** It installs and checks everything before run, reports the
   installed versions, and tells whether inference will use the GPU or fall back to CPU.
 
 ## Requirements
