@@ -148,6 +148,11 @@ def postprocessSegmentation(segmentationNode, volumeNode, options, log=None):
                     if externalArray is not None and int(externalArray.sum()) == 0:
                         externalArray = None
 
+        # Anatomical airway volume (airway plus any recovered sinuses), measured before the
+        # extension pads it and before the external air is merged, so it stays clinically meaningful.
+        airwayVolumeMm3 = float(int((array > 0).sum())) * float(np.prod(labelmapNode.GetSpacing()))
+        _log(log, "Airway volume: %.2f mL (%.0f mm^3)." % (airwayVolumeMm3 / 1000.0, airwayVolumeMm3))
+
         # Extension is applied to the AIRWAY only, then (if requested) the external air is merged
         # in AFTER extension, padded onto the extended grid. This guarantees the caudal extension
         # replicates the airway's terminal slice, never the external air (which can sit lower).
@@ -170,6 +175,7 @@ def postprocessSegmentation(segmentationNode, volumeNode, options, log=None):
                 _log(log, "External air merged into the airway segment.")
 
         node = _buildAirwaySegmentation(array, ijkToRAS, segmentationNode.GetName(), log)
+        node.SetAttribute("AUAE.airwayVolumeMm3", "%.1f" % airwayVolumeMm3)
         if externalArray is not None:
             # Separate segment: import on the original (unextended) grid; Slicer resamples it
             # into the node's shared geometry.
@@ -441,12 +447,30 @@ def _sealedHeadMask(volumeArray, threshold, spacingIJK, log=None):
         sizes = np.bincount(labeled.ravel())
         sizes[0] = 0
         tissue = labeled == int(np.argmax(sizes))  # the patient, not the table or props
-    # Seal openings up to ~3 mm before filling; iterations scale with the finest voxel spacing.
+
+    # The head envelope is a coarse structure, so on large volumes the closing and hole-fill run
+    # on a downsampled copy and the result is resized back. This keeps the cost bounded without
+    # changing the envelope meaningfully; small volumes are processed at full resolution.
     minSpacing = min([float(s) for s in spacingIJK if float(s) > 0] or [1.0])
-    iterations = max(1, min(8, int(round(3.0 / minSpacing))))
-    sealed = ndimage.binary_closing(tissue, iterations=iterations)
-    sealed = ndimage.binary_fill_holes(sealed)
+    factor = 2 if tissue.size > 12_000_000 else 1
+    if factor > 1:
+        small = tissue[::factor, ::factor, ::factor]
+        iterations = max(1, min(8, int(round(3.0 / (minSpacing * factor)))))
+        sealedSmall = ndimage.binary_fill_holes(ndimage.binary_closing(small, iterations=iterations))
+        sealed = _upsampleNearest(sealedSmall, tissue.shape, factor)
+        _log(log, "Air envelope computed at 1/%d resolution for speed." % factor)
+    else:
+        iterations = max(1, min(8, int(round(3.0 / minSpacing))))
+        sealed = ndimage.binary_fill_holes(ndimage.binary_closing(tissue, iterations=iterations))
     return sealed
+
+
+def _upsampleNearest(small, fullShape, factor):
+    """Nearest-neighbour upsample a boolean array by an integer factor, cropped to fullShape."""
+    up = small
+    for axis in range(up.ndim):
+        up = np.repeat(up, factor, axis=axis)
+    return up[:fullShape[0], :fullShape[1], :fullShape[2]]
 
 
 def computeInternalAirCavities(airMask, sealedHead, airwayArray, voxelVolumeMm3, log=None,

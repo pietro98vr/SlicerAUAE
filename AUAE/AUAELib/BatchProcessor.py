@@ -26,17 +26,52 @@ def defaultTemplatePath():
     return Path(__file__).parent.joinpath("..", "Resources", "batch_template.json").resolve()
 
 
+def _looksLikeDicom(path):
+    """True if a file is DICOM (by .dcm extension or the DICM magic at byte 128)."""
+    if path.lower().endswith(".dcm"):
+        return True
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(128)
+            return handle.read(4) == b"DICM"
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _isDicomFolder(folder):
+    """True if a folder directly holds at least one DICOM file (a DICOM series)."""
+    try:
+        for name in os.listdir(folder):
+            p = os.path.join(folder, name)
+            if os.path.isfile(p) and _looksLikeDicom(p):
+                return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
 def listVolumesInFolder(folder):
-    """Return the sorted volume files directly inside a folder (folder-in/folder-out batch)."""
+    """List the inputs in a folder: single-file volumes plus DICOM series.
+
+    Each entry is either a volume file path (.nii/.nrrd/...) or a folder holding a DICOM series
+    (a subfolder, or the folder itself when it is a single series). The batch loads each entry
+    accordingly, so a folder of per-patient DICOM subfolders works out of the box.
+    """
     folder = str(folder)
     if not os.path.isdir(folder):
         return []
-    found = []
+    inputs = []
     for name in sorted(os.listdir(folder)):
-        low = name.lower()
-        if os.path.isfile(os.path.join(folder, name)) and any(low.endswith(e) for e in VOLUME_EXTENSIONS):
-            found.append(os.path.join(folder, name))
-    return found
+        p = os.path.join(folder, name)
+        if os.path.isfile(p) and any(name.lower().endswith(e) for e in VOLUME_EXTENSIONS):
+            inputs.append(p)
+    for name in sorted(os.listdir(folder)):
+        sub = os.path.join(folder, name)
+        if os.path.isdir(sub) and _isDicomFolder(sub):
+            inputs.append(sub)
+    if not inputs and _isDicomFolder(folder):
+        inputs.append(folder)  # the folder itself is a single DICOM series
+    return inputs
 
 
 def folderConfig(inputFolder, outputRoot, exportFormats, postprocess=None, exportTargets=None):
@@ -122,7 +157,7 @@ class BatchProcessor:
     def cancel(self):
         self._cancelled = True
 
-    def run(self, config, exportFormatEnum, deviceKwargs=None):
+    def run(self, config, exportFormatEnum, deviceKwargs=None, onProgress=None):
         """Process every volume in config. Returns a per-volume result summary list.
 
         :param exportFormatEnum: the ExportFormat flag value selected for all volumes.
@@ -131,7 +166,7 @@ class BatchProcessor:
         # 'extend' mode reruns only the airway extension on existing segmentation files, so
         # segmentation and extension can be two separate batch passes (no model / GPU needed).
         if config.get("mode", "segment") == "extend":
-            return self._runExtend(config, exportFormatEnum)
+            return self._runExtend(config, exportFormatEnum, onProgress=onProgress)
 
         from SlicerNNUNetLib import Parameter, SegmentationLogic
         deviceKwargs = deviceKwargs or {}
@@ -166,9 +201,9 @@ class BatchProcessor:
             volumeNode = None
             segmentationNode = None
             try:
-                if not os.path.isfile(volumePath):
-                    raise FileNotFoundError("Input volume not found: " + volumePath)
-                volumeNode = slicer.util.loadVolume(volumePath)
+                if not os.path.exists(volumePath):
+                    raise FileNotFoundError("Input not found: " + volumePath)
+                volumeNode = self._loadInput(volumePath)
 
                 logic.setParameter(makeParameter())
                 logic.startSegmentation(volumeNode)
@@ -185,6 +220,7 @@ class BatchProcessor:
                 subfolder = os.path.join(outputRoot, self._subfolderName(volumePath))
                 os.makedirs(subfolder, exist_ok=True)
                 self._exportFn(segmentationNode, subfolder, exportFormatEnum, config.get("export_targets") or ["merged"])
+                self._writeAirwayVolume(segmentationNode, subfolder, volumePath)
 
                 entry["status"] = "ok"
                 entry["output"] = subfolder
@@ -203,10 +239,15 @@ class BatchProcessor:
                             pass
                 slicer.app.processEvents()
             results.append(entry)
+            if onProgress:
+                try:
+                    onProgress(index, len(volumes))
+                except Exception:  # noqa: BLE001
+                    pass
 
         return results
 
-    def _runExtend(self, config, exportFormatEnum):
+    def _runExtend(self, config, exportFormatEnum, onProgress=None):
         """Extend a list of already-existing airway segmentations (batch 'extend' mode).
 
         Each item in 'volumes' is a saved airway segmentation labelmap (NIFTI/NRRD). It is
@@ -269,8 +310,41 @@ class BatchProcessor:
                             pass
                 slicer.app.processEvents()
             results.append(entry)
+            if onProgress:
+                try:
+                    onProgress(index, len(segmentations))
+                except Exception:  # noqa: BLE001
+                    pass
 
         return results
+
+    def _loadInput(self, path):
+        """Load a batch input: a volume file, or a folder holding a DICOM series."""
+        if os.path.isdir(path):
+            return self._loadDicomSeries(path)
+        node = slicer.util.loadVolume(path)
+        if node is None:
+            raise RuntimeError("Could not load volume: " + path)
+        return node
+
+    def _loadDicomSeries(self, folder):
+        """Import and load a DICOM series folder, returning its scalar volume node."""
+        from DICOMLib import DICOMUtils
+        loadedIds = []
+        with DICOMUtils.TemporaryDICOMDatabase() as db:
+            DICOMUtils.importDicom(folder, db)
+            for patientUID in db.patients():
+                loadedIds.extend(DICOMUtils.loadPatientByUID(patientUID))
+        volumes = []
+        for nodeId in loadedIds:
+            node = slicer.mrmlScene.GetNodeByID(nodeId)
+            if node is not None and node.IsA("vtkMRMLScalarVolumeNode"):
+                volumes.append(node)
+        if not volumes:
+            raise RuntimeError("No volume found in DICOM folder: " + folder)
+        for extra in volumes[1:]:  # keep the first series, drop the rest to avoid clutter
+            slicer.mrmlScene.RemoveNode(extra)
+        return volumes[0]
 
     @staticmethod
     def _subfolderName(volumePath):
@@ -280,3 +354,17 @@ class BatchProcessor:
                 stem = stem[: -len(suffix)]
                 break
         return stem or "case"
+
+    def _writeAirwayVolume(self, segmentationNode, subfolder, sourcePath):
+        """Write the airway volume (mL) computed during post-processing to a text file."""
+        try:
+            mm3 = segmentationNode.GetAttribute("AUAE.airwayVolumeMm3")
+            if not mm3:
+                return
+            mm3 = float(mm3)
+            with open(os.path.join(subfolder, "airway_volume.txt"), "w", encoding="utf-8") as handle:
+                handle.write("case\t%s\n" % os.path.basename(sourcePath))
+                handle.write("airway_volume_mL\t%.2f\n" % (mm3 / 1000.0))
+                handle.write("airway_volume_mm3\t%.0f\n" % mm3)
+        except Exception as exc:  # noqa: BLE001
+            self._progress("Could not write airway volume: " + str(exc))

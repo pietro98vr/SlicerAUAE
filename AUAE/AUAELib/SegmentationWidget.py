@@ -97,6 +97,7 @@ class SegmentationWidget(qt.QWidget):
         self.currentInfoTextEdit = qt.QTextEdit()
         self.currentInfoTextEdit.setReadOnly(True)
         self.currentInfoTextEdit.setLineWrapMode(qt.QTextEdit.NoWrap)
+        self.currentInfoTextEdit.setMinimumHeight(160)  # taller: it holds progress and the airway volume
         self.fullInfoLogs = []
 
         self.stopButton = createButton("Stop", callback=self.onStopClicked, toolTip="Click to Stop the segmentation.")
@@ -334,7 +335,8 @@ class SegmentationWidget(qt.QWidget):
         folderForm = qt.QFormLayout()
         self.batchInputFolderLineEdit = qt.QLineEdit(folderBox)
         self.batchInputFolderLineEdit.setToolTip(
-            "Folder of input volumes (.nii/.nii.gz/.nrrd/.mha...). Every volume in it is processed."
+            "Folder of inputs: single-file volumes (.nii/.nii.gz/.nrrd/.mha...) and/or DICOM "
+            "series (per-patient subfolders). Every input in it is processed."
         )
         inRow = qt.QHBoxLayout()
         inRow.addWidget(self.batchInputFolderLineEdit, 1)
@@ -390,7 +392,18 @@ class SegmentationWidget(qt.QWidget):
             toolTip="Segment and export every volume listed in the template into per-volume subfolders."
         ))
         layout.addWidget(templateBox)
+
+        # Progress across the batch, shown only while a run is in flight.
+        self.batchProgressBar = qt.QProgressBar(widget)
+        self.batchProgressBar.setVisible(False)
+        layout.addWidget(self.batchProgressBar)
         return widget
+
+    def _onBatchProgress(self, done, total):
+        """Advance the batch progress bar (called once per processed case)."""
+        self.batchProgressBar.setMaximum(max(1, int(total)))
+        self.batchProgressBar.setValue(int(done))
+        slicer.app.processEvents()
 
     def _createDependenciesWidget(self):
         widget = qt.QWidget()
@@ -750,9 +763,12 @@ class SegmentationWidget(qt.QWidget):
             slicer.util.warningDisplay("Please select what to export (airway, external air, or merged).")
             return
 
-        folderPath = qt.QFileDialog.getExistingDirectory(self, "Please select the export folder")
+        folderPath = qt.QFileDialog.getExistingDirectory(
+            self, "Please select the export folder", getattr(self, "_lastExportFolder", "")
+        )
         if not folderPath:
             return
+        self._lastExportFolder = folderPath  # start here next time
 
         with slicer.util.tryWithErrorDisplay("Export to " + folderPath + " failed.", waitCursor=True):
             self.exportSegmentation(segmentationNode, folderPath, selectedFormats, targets)
@@ -914,6 +930,9 @@ class SegmentationWidget(qt.QWidget):
         """Shared batch driver for both folder-in/folder-out and template runs."""
         self.currentInfoTextEdit.clear()
         self._setApplyVisible(False)
+        self.batchProgressBar.setValue(0)
+        self.batchProgressBar.setMaximum(max(1, len(config.get("volumes", []))))
+        self.batchProgressBar.setVisible(True)
         try:
             if not self._ensureReadyToRun():
                 return
@@ -923,12 +942,14 @@ class SegmentationWidget(qt.QWidget):
             processor = BatchProcessorLib.BatchProcessor(
                 self.nnUnetFolder(), self.exportSegmentation, self.onProgressInfo
             )
-            results = processor.run(config, exportFormats, deviceKwargs=deviceKwargs)
+            results = processor.run(config, exportFormats, deviceKwargs=deviceKwargs,
+                                    onProgress=self._onBatchProgress)
         except Exception as exc:  # noqa: BLE001
             slicer.util.errorDisplay("Batch processing failed:\n" + str(exc))
             return
         finally:
             self._setApplyVisible(True)
+            self.batchProgressBar.setVisible(False)
 
         ok = sum(1 for r in results if r["status"] == "ok")
         failed = [r for r in results if r["status"] != "ok"]

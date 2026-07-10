@@ -287,6 +287,43 @@ with `min_internal_air_mm3`, `segment_external_air` and `merge_external_air`, `s
 and the `extension` block. `mode` is `segment` to run the model, or `extend` to rerun only the
 extension on existing segmentation files (no model or GPU needed).
 
+## Headless (command line)
+
+The batch logic needs no graphical interface, so AUAE can run from the command line through
+Slicer's headless Python. The runner is `AUAE/CLI/auae_batch.py`, and everything after the `--`
+is passed to it:
+
+```
+Slicer --no-main-window --python-script <path>/AUAE/CLI/auae_batch.py -- \
+    --input /data/cbct --output /data/out --formats STL NRRD \
+    --targets airway external --device auto --external
+```
+
+On Windows the Slicer launcher is `Slicer.exe`, for example
+`"C:\Users\<you>\AppData\Local\slicer.org\3D Slicer 5.10.0\Slicer.exe"`.
+
+The NNUNet extension must be installed and its Python dependencies present (run the module once
+from the GUI to install them). The model weights are downloaded on demand when missing.
+
+Arguments:
+
+- `--input FOLDER` or `--template FILE.json`: a folder of volumes and/or DICOM series, or a JSON
+  template. One of the two is required.
+- `--output FOLDER`: output folder (default: an `AUAE_output` folder beside the input).
+- `--formats`: any of `STL OBJ NIFTI NRRD` (default `STL NIFTI`).
+- `--targets`: any of `airway external merged` (default `airway external`).
+- `--device`: `auto`, `cuda`, or `cpu` (default `auto`).
+- `--mode`: `segment` (default) or `extend`.
+- `--sinus` / `--no-sinus`: frontal sinus recovery, on by default.
+- `--external`, `--merge-external`: the external face-air segment and its merge.
+- `--keep-largest`, `--no-remove-islands`: island cleanup.
+- `--smoothing 0..1`, `--min-island MM3`, `--min-internal MM3`: post-processing thresholds.
+- `--extend MM`: inferior extension length in millimetres (0 = off).
+
+The exit code is `0` when every case succeeded, `1` when at least one failed, and `2` on a fatal
+error (bad arguments, missing NNUNet extension, no inputs, or missing weights), so it slots into a
+shell pipeline.
+
 ## Module and function reference
 
 - **AirwayExtension** is the interface-free array logic. `postprocessSegmentation` is the single
