@@ -281,85 +281,115 @@ class SegmentationWidget(qt.QWidget):
         return widget
 
     def _createExportWidget(self):
+        # Two clearly separated groups so it is obvious WHAT is written and in WHICH format:
+        # "What to export" (which segments) and "File format" (mesh vs labelmap).
         exportWidget = qt.QWidget()
-        exportLayout = qt.QFormLayout(exportWidget)
+        layout = qt.QVBoxLayout(exportWidget)
 
-        # Formats: STL/OBJ are surface meshes; NIFTI/NRRD are labelmaps.
-        self.stlCheckBox = qt.QCheckBox(exportWidget)
-        self.stlCheckBox.setChecked(True)
-        self.objCheckBox = qt.QCheckBox(exportWidget)
-        self.niftiCheckBox = qt.QCheckBox(exportWidget)
-        self.niftiCheckBox.setChecked(True)
-        self.nrrdCheckBox = qt.QCheckBox(exportWidget)
-        exportLayout.addRow("Export STL", self.stlCheckBox)
-        exportLayout.addRow("Export OBJ", self.objCheckBox)
-        exportLayout.addRow("Export NIFTI", self.niftiCheckBox)
-        exportLayout.addRow("Export NRRD", self.nrrdCheckBox)
-
-        # What to export: the airway, the external air, and/or a single merged file. Independent.
-        self.exportAirwayCheckBox = qt.QCheckBox(exportWidget)
+        whatBox = qt.QGroupBox("What to export", exportWidget)
+        whatLayout = qt.QVBoxLayout(whatBox)
+        self.exportAirwayCheckBox = qt.QCheckBox("Airway", whatBox)
         self.exportAirwayCheckBox.setChecked(True)
-        self.exportAirwayCheckBox.setToolTip("Export the airway segment.")
-        self.exportExternalAirCheckBox = qt.QCheckBox(exportWidget)
-        self.exportExternalAirCheckBox.setToolTip("Export the external face-air segment (only present if it was segmented).")
-        self.exportMergedCheckBox = qt.QCheckBox(exportWidget)
-        self.exportMergedCheckBox.setToolTip("Export a single merged file containing all segments together.")
-        exportLayout.addRow("Export airway", self.exportAirwayCheckBox)
-        exportLayout.addRow("Export external air", self.exportExternalAirCheckBox)
-        exportLayout.addRow("Export merged (single)", self.exportMergedCheckBox)
+        self.exportAirwayCheckBox.setToolTip("Write the airway segment.")
+        self.exportExternalAirCheckBox = qt.QCheckBox("External air (if segmented)", whatBox)
+        self.exportExternalAirCheckBox.setToolTip("Write the external face-air segment; skipped if it was not segmented.")
+        self.exportMergedCheckBox = qt.QCheckBox("Merged (all segments in one file)", whatBox)
+        self.exportMergedCheckBox.setToolTip("Write a single file that contains all segments together.")
+        for cb in (self.exportAirwayCheckBox, self.exportExternalAirCheckBox, self.exportMergedCheckBox):
+            whatLayout.addWidget(cb)
+        layout.addWidget(whatBox)
 
-        exportLayout.addRow(createButton("Export", callback=self.onExportClicked, parent=exportWidget))
+        formatBox = qt.QGroupBox("File format", exportWidget)
+        formatLayout = qt.QVBoxLayout(formatBox)
+        self.stlCheckBox = qt.QCheckBox("STL (surface mesh)", formatBox)
+        self.stlCheckBox.setChecked(True)
+        self.objCheckBox = qt.QCheckBox("OBJ (surface mesh)", formatBox)
+        self.niftiCheckBox = qt.QCheckBox("NIFTI (labelmap, .nii.gz)", formatBox)
+        self.niftiCheckBox.setChecked(True)
+        self.nrrdCheckBox = qt.QCheckBox("NRRD (labelmap, .nrrd)", formatBox)
+        for cb in (self.stlCheckBox, self.objCheckBox, self.niftiCheckBox, self.nrrdCheckBox):
+            formatLayout.addWidget(cb)
+        layout.addWidget(formatBox)
+
+        layout.addWidget(createButton(
+            "Export", callback=self.onExportClicked, parent=exportWidget,
+            toolTip="Write each selected target in each selected format into a folder you choose.",
+        ))
         return exportWidget
 
     def _createBatchWidget(self):
         widget = qt.QWidget()
-        form = qt.QFormLayout(widget)
+        layout = qt.QVBoxLayout(widget)
 
-        # Classic folder-in / folder-out: point at a folder of volumes, get a mirrored output
-        # folder. Uses the current Post-processing and Export settings.
-        self.batchInputFolderLineEdit = qt.QLineEdit(widget)
+        # Simple path: folder in, folder out. No JSON needed; it reuses the current settings.
+        folderBox = qt.QGroupBox("Batch by folder (recommended)", widget)
+        folderLayout = qt.QVBoxLayout(folderBox)
+        folderHint = qt.QLabel(
+            "Segment every volume in a folder, using the current Post-processing and Export "
+            "settings above. No JSON needed."
+        )
+        folderHint.setWordWrap(True)
+        folderLayout.addWidget(folderHint)
+
+        folderForm = qt.QFormLayout()
+        self.batchInputFolderLineEdit = qt.QLineEdit(folderBox)
         self.batchInputFolderLineEdit.setToolTip(
             "Folder of input volumes (.nii/.nii.gz/.nrrd/.mha...). Every volume in it is processed."
         )
         inRow = qt.QHBoxLayout()
         inRow.addWidget(self.batchInputFolderLineEdit, 1)
-        inRow.addWidget(createButton("Browse...", callback=self.onBrowseBatchInputFolder, parent=widget))
-        inRowW = qt.QWidget(widget)
+        inRow.addWidget(createButton("Browse...", callback=self.onBrowseBatchInputFolder, parent=folderBox))
+        inRowW = qt.QWidget(folderBox)
         inRowW.setLayout(inRow)
-        form.addRow("Input folder", inRowW)
+        folderForm.addRow("Input folder", inRowW)
 
-        self.batchOutputFolderLineEdit = qt.QLineEdit(widget)
+        self.batchOutputFolderLineEdit = qt.QLineEdit(folderBox)
         self.batchOutputFolderLineEdit.setToolTip(
             "Output folder. Leave empty to use an 'AUAE_output' folder beside the inputs."
         )
         outRow = qt.QHBoxLayout()
         outRow.addWidget(self.batchOutputFolderLineEdit, 1)
-        outRow.addWidget(createButton("Browse...", callback=self.onBrowseBatchOutputFolder, parent=widget))
-        outRowW = qt.QWidget(widget)
+        outRow.addWidget(createButton("Browse...", callback=self.onBrowseBatchOutputFolder, parent=folderBox))
+        outRowW = qt.QWidget(folderBox)
         outRowW.setLayout(outRow)
-        form.addRow("Output folder", outRowW)
+        folderForm.addRow("Output folder", outRowW)
+        folderLayout.addLayout(folderForm)
 
-        form.addRow(createButton(
-            "Run batch (folder)", callback=self.onRunBatchFolderClicked, parent=widget,
+        folderLayout.addWidget(createButton(
+            "Run batch (folder)", callback=self.onRunBatchFolderClicked, parent=folderBox,
             toolTip="Segment and export every volume in the input folder, using the current "
                     "post-processing and export settings, into per-volume subfolders."
         ))
+        layout.addWidget(folderBox)
 
-        # Advanced: a JSON template for explicit per-run control (ordered list, extension block).
-        self.batchTemplateLineEdit = qt.QLineEdit(widget)
+        # Advanced path: a JSON template for explicit per-run control (ordered list, extension).
+        templateBox = qt.QGroupBox("Batch by template (advanced, optional)", widget)
+        templateLayout = qt.QVBoxLayout(templateBox)
+        templateHint = qt.QLabel(
+            "Optional. For explicit control: an ordered list of volumes and every option in one "
+            "JSON file. Not needed for the folder run above."
+        )
+        templateHint.setWordWrap(True)
+        templateLayout.addWidget(templateHint)
+
+        self.batchTemplateLineEdit = qt.QLineEdit(templateBox)
         self.batchTemplateLineEdit.text = str(BatchProcessorLib.defaultTemplatePath())
-        self.batchTemplateLineEdit.setToolTip("Advanced: JSON template listing the volumes and options.")
+        self.batchTemplateLineEdit.setToolTip("JSON template listing the volumes and options.")
         browseRow = qt.QHBoxLayout()
         browseRow.addWidget(self.batchTemplateLineEdit, 1)
-        browseRow.addWidget(createButton("Browse...", callback=self.onBrowseTemplate, parent=widget))
-        browseRow.addWidget(createButton("Open folder", callback=self.onOpenTemplateFolder, parent=widget))
-        rowWidget = qt.QWidget(widget)
+        browseRow.addWidget(createButton("Browse...", callback=self.onBrowseTemplate, parent=templateBox))
+        browseRow.addWidget(createButton("Open folder", callback=self.onOpenTemplateFolder, parent=templateBox))
+        rowWidget = qt.QWidget(templateBox)
         rowWidget.setLayout(browseRow)
-        form.addRow("Template JSON (advanced)", rowWidget)
-        form.addRow(createButton(
-            "Run batch (template)", callback=self.onRunBatchClicked, parent=widget,
+        templateForm = qt.QFormLayout()
+        templateForm.addRow("Template JSON", rowWidget)
+        templateLayout.addLayout(templateForm)
+
+        templateLayout.addWidget(createButton(
+            "Run batch (template)", callback=self.onRunBatchClicked, parent=templateBox,
             toolTip="Segment and export every volume listed in the template into per-volume subfolders."
         ))
+        layout.addWidget(templateBox)
         return widget
 
     def _createDependenciesWidget(self):
@@ -416,7 +446,12 @@ class SegmentationWidget(qt.QWidget):
         setBoxAndTextVisibilityOnThreeDViews(False)
 
     def _updateStopIcon(self):
-        self.stopButton.setIcon(qt.QIcon(self.loading.currentPixmap()))
+        # The loading QMovie keeps ticking after the widget is destroyed on a module reload;
+        # guard against the stale signal touching an already-deleted button.
+        try:
+            self.stopButton.setIcon(qt.QIcon(self.loading.currentPixmap()))
+        except (ValueError, RuntimeError):
+            pass
 
     def onStopClicked(self):
         """Stop the running inference and restore the buttons once cleanup is done."""

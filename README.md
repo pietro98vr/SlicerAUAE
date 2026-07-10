@@ -125,8 +125,6 @@ restart. It runs the nnU-Net inference and pulls in the PyTorch extension.
 
 #### Newer GPUs (RTX 50-series / sm_120) and the PyTorch build
 
-This one trips up a lot of people, so read it before you fight the GPU.
-
 **Symptom.** At startup, or when AUAE runs its preflight, you see a message like:
 
 > NVIDIA GeForce RTX 5070 Ti with CUDA capability sm_120 is not compatible with the current
@@ -155,10 +153,10 @@ up to sm_90, so it has no kernels for your card. Only a PyTorch built for **CUDA
    is still there, the new install fails with a `torchgen` error. In the folder printed above,
    remove `torch`, `torchgen`, `torchvision`, `functorch`, their matching `*.dist-info` folders,
    and any half-removed leftover that pip renamed to start with a tilde (for example a folder
-   named `~orch`). This step is the one most people miss.
+   named `~orch`).
 4. Reopen Slicer. In PyTorch Utils, instead of letting it search automatically, choose the
-   **CUDA 12.8 (cu128)** backend and install. It is a large download (around 4 GB), so give it
-   time. From the Python console the same thing is, for example:
+   **CUDA 12.8 (cu128)** backend and install. It is a large download, around 4 GB. From the
+   Python console the same thing is, for example:
    ```python
    import PyTorchUtils
    PyTorchUtils.PyTorchUtilsLogic().installTorch(askConfirmation=True, forceComputationBackend="cu128")
@@ -176,8 +174,8 @@ they do not run on the packaged Slicer. On Linux an RTX 50-series card therefore
 from the stock Slicer package until its base is updated; use Windows, build a compatible torch
 yourself, or run on CPU.
 
-**While you wait.** Set **Inference device** to **CPU** in Dependencies & CUDA. A run takes up
-to about an hour on CPU, but it works and produces the same result.
+**CPU fallback.** Set **Inference device** to **CPU** in Dependencies & CUDA. A run takes up to
+about an hour on CPU, but it works and produces the same result.
 
 ## Use the extension
 
@@ -221,11 +219,13 @@ flow work. The direction is always inferior, so only the length in millimetres i
 
 ### 4. Export
 
-Pick the formats and what to export, then press **Export**:
+The section has two groups. Tick what you want in each, then press **Export**:
 
-- Formats: STL and OBJ are surface meshes; NIFTI and NRRD are labelmaps.
-- Targets are independent: **Export airway**, **Export external air**, and **Export merged** (a
-  single file with all segments together). A target with no matching segment is skipped.
+- **What to export** (independent): **Airway**, **External air** (skipped if it was not
+  segmented), and **Merged** (all segments in one file).
+- **File format**: **STL** and **OBJ** are surface meshes; **NIFTI** and **NRRD** are labelmaps.
+
+Each chosen target is written in each chosen format, into a folder you pick.
 
 ## How the post-processing works
 
