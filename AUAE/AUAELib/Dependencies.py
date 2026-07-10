@@ -57,17 +57,35 @@ def slicerVersionTuple():
 
 
 def torchStatus():
-    """Return a dict describing the installed torch build and CUDA usability."""
+    """Return a dict describing the installed torch build, the GPU, and CUDA usability.
+
+    Also reports the GPU compute capability against the architectures the installed torch was
+    compiled for. A brand-new GPU (e.g. an RTX 50-series, sm_120) paired with a torch build
+    that only ships up to sm_90 produces a 'no kernel image is available' failure at runtime;
+    this is detected here before a run so it can be reported instead of crashing mid-inference.
+    """
     status = {"installed": False, "version": None, "cudaBuild": None, "cudaAvailable": False,
-              "device": None, "vramGb": None}
+              "device": None, "vramGb": None, "computeCapability": None, "archList": None,
+              "archStatus": "unknown", "archMessage": None}
     try:
         import torch
         status["installed"] = True
         status["version"] = torch.__version__
         status["cudaBuild"] = torch.version.cuda
         status["cudaAvailable"] = bool(torch.cuda.is_available())
+        try:
+            status["archList"] = list(torch.cuda.get_arch_list())
+        except Exception:  # noqa: BLE001
+            pass
+        if torch.cuda.device_count() > 0:
+            try:
+                cc = torch.cuda.get_device_capability(0)
+                status["computeCapability"] = "%d.%d" % (cc[0], cc[1])
+                status["device"] = torch.cuda.get_device_name(0)
+                status["archStatus"], status["archMessage"] = _archCompatibility(cc, status["archList"])
+            except Exception:  # noqa: BLE001
+                pass
         if status["cudaAvailable"]:
-            status["device"] = torch.cuda.get_device_name(0)
             try:
                 free, total = torch.cuda.mem_get_info(0)
                 status["vramGb"] = round(total / (1024 ** 3), 1)
@@ -76,6 +94,35 @@ def torchStatus():
     except Exception:  # noqa: BLE001
         pass
     return status
+
+
+def _archCompatibility(cc, archList):
+    """Compare the GPU compute capability with the torch build's compiled architectures.
+
+    Returns (status, message) where status is 'ok', 'warn', or 'unknown'. 'warn' means the GPU
+    is newer than every architecture the torch build was compiled for, so CUDA kernels will
+    fail to launch and the user needs a newer torch build (e.g. a cu128 wheel for sm_120).
+    """
+    if not archList:
+        return ("unknown", None)
+    gpu = cc[0] * 10 + cc[1]
+    smMajors = []
+    for a in archList:
+        try:
+            if a.startswith("sm_"):
+                smMajors.append(int(a.split("_")[1][:2]) // 1)  # e.g. sm_90 -> 90
+        except Exception:  # noqa: BLE001
+            pass
+    exact = ("sm_%d" % gpu) in archList
+    maxSm = max(smMajors) if smMajors else 0
+    if exact or gpu <= maxSm:
+        return ("ok", "GPU sm_%d is covered by the installed torch build." % gpu)
+    return ("warn",
+            "GPU sm_%d is NEWER than every architecture this torch build was compiled for "
+            "(max sm_%d). CUDA kernels will fail with 'no kernel image is available'. "
+            "Install a newer torch wheel that supports your GPU (for RTX 50-series / sm_120 use a "
+            "CUDA 12.8+ build). See https://discourse.slicer.org/t/pytorch-cuda-incompatibility-"
+            "with-nvidia-rtx-5070-ti/43233" % (gpu, maxSm))
 
 
 def nnunetStatus():
@@ -125,6 +172,10 @@ def report(log):
     ts = torchStatus()
     if ts["installed"]:
         log("torch:                %s | CUDA build: %s" % (ts["version"], ts["cudaBuild"]))
+        if ts["device"]:
+            log("GPU:                  %s | compute capability %s" % (ts["device"], ts["computeCapability"]))
+        if ts["archList"]:
+            log("torch archs:          %s" % ", ".join(ts["archList"]))
     else:
         log("torch:                not installed (installed by the PyTorch extension via dependencies)")
         ready = False
@@ -136,7 +187,11 @@ def report(log):
 
     # CUDA verdict
     log("--- CUDA verdict ---")
-    if ts["installed"] and ts["cudaAvailable"]:
+    if ts["installed"] and ts.get("archStatus") == "warn":
+        log("WARNING (torch/CUDA conflict): " + ts["archMessage"])
+        log("Until a matching torch build is installed, set 'Inference device: CPU' or the GPU run will crash.")
+        ready = False
+    elif ts["installed"] and ts["cudaAvailable"]:
         vram = (" (%.1f GB VRAM)" % ts["vramGb"]) if ts["vramGb"] else ""
         log("GPU inference AVAILABLE: %s%s. Inference will use CUDA." % (ts["device"], vram))
     elif ts["installed"] and ts["cudaBuild"] is None:

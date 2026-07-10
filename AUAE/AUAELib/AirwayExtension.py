@@ -2,8 +2,9 @@
 
 This module is the distinctive part of this project, which is based on SlicerUpperAirwaySegmentator:
 the geometric logic that extends the final binary airway mask beyond the acquired
-field of view, plus the connected-component cleanup used in place of the upstream
-Segment Editor "Islands" effect (which is removed together with the embedded editor).
+field of view; the automatic connected-component cleanup applied during the segmentation
+step (the embedded Segment Editor stays available for manual refinement); and the optional
+external face-air segment used as an inlet volume for flow modelling.
 
 The functions here are deliberately kept free of any Qt/UI dependency so they can be
 unit-tested in a headless Slicer session. They operate on NumPy arrays in Slicer's
@@ -40,6 +41,15 @@ AIRWAY_SEGMENT_COLOR = (130 / 255.0, 177 / 255.0, 255 / 255.0)  # light blue
 # Upstream default small-island threshold: 200 voxels at 0.3 mm isotropic.
 DEFAULT_MIN_ISLAND_MM3 = (0.3 ** 3) * 200
 
+# Second, optional segment: the ambient air in front of the face. For flow modelling this
+# provides the external inlet volume the air enters through (nostrils / mouth), so a CFD mesh
+# has a domain upstream of the airway rather than a bare opening.
+EXTERNAL_AIR_SEGMENT_NAME = "External air (face)"
+EXTERNAL_AIR_SEGMENT_COLOR = (255 / 255.0, 214 / 255.0, 102 / 255.0)  # warm yellow
+# Ignore ambient-air blobs smaller than this (mm^3): keeps the meaningful front-of-face volume,
+# drops trapped-air specks between skin folds, headrest gaps, etc.
+DEFAULT_MIN_EXTERNAL_AIR_MM3 = 1000.0
+
 
 def defaultOptions():
     """Return the default post-processing options shared by interactive and batch runs."""
@@ -47,6 +57,9 @@ def defaultOptions():
         "removeSmallIslands": True,
         "minIslandMm3": DEFAULT_MIN_ISLAND_MM3,
         "keepLargestIsland": False,
+        "smoothingFactor": 0.0,
+        "segmentExternalAir": False,
+        "mergeExternalAir": False,
         "extend": False,
         "direction": EXTENSION_DIRECTIONS[0],
         "lengthMm": 100.0,
@@ -88,14 +101,38 @@ def postprocessSegmentation(segmentationNode, volumeNode, options, log=None):
             voxelVolumeMm3 = float(np.prod(labelmapNode.GetSpacing()))
             array = removeSmallIslands(array, options.get("minIslandMm3", DEFAULT_MIN_ISLAND_MM3), voxelVolumeMm3, log)
 
+        # Optional second segment: ambient air in front of the face (flow-modelling inlet).
+        # Computed on the labelmap grid (same as the cleaned airway) so the two masks align.
+        externalArray = None
+        baseIJKToRAS = volumeIJKToRASArray(labelmapNode)
+        if options.get("segmentExternalAir", False):
+            voxelVolumeMm3 = float(np.prod(labelmapNode.GetSpacing()))
+            externalArray = computeExternalAirMask(
+                _volumeArrayLike(volumeNode, array), array, baseIJKToRAS, voxelVolumeMm3, log
+            )
+            if externalArray is not None and int(externalArray.sum()) == 0:
+                externalArray = None
+            # 'Merge into a single segmentation': union external air into the airway mask BEFORE
+            # extension, so the whole fluid domain is one segment on one grid.
+            if externalArray is not None and options.get("mergeExternalAir", False):
+                array = ((array > 0) | (externalArray > 0)).astype(np.uint8)
+                externalArray = None
+                _log(log, "External air merged into the airway segment.")
+
         if options.get("extend", False) and float(options.get("lengthMm", 0.0)) > 0:
             array, ijkToRAS = extendBinaryArray(
                 array, labelmapNode, float(options["lengthMm"]), options.get("direction", EXTENSION_DIRECTIONS[0]), log
             )
         else:
-            ijkToRAS = volumeIJKToRASArray(labelmapNode)
+            ijkToRAS = baseIJKToRAS
 
-        return _buildAirwaySegmentation(array, ijkToRAS, segmentationNode.GetName(), log)
+        node = _buildAirwaySegmentation(array, ijkToRAS, segmentationNode.GetName(), log)
+        if externalArray is not None:
+            # Separate segment: import on the original (unextended) grid; Slicer resamples it
+            # into the node's shared geometry.
+            _addExternalAirSegment(node, externalArray, baseIJKToRAS, log)
+        _applyDisplaySmoothing(node, options.get("smoothingFactor", 0.0))
+        return node
     finally:
         slicer.mrmlScene.RemoveNode(labelmapNode)
 
@@ -131,7 +168,9 @@ def extendSegmentation(segmentationNode, volumeNode, options, log=None):
         array, ijkToRAS = extendBinaryArray(
             array, labelmapNode, lengthMm, options.get("direction", EXTENSION_DIRECTIONS[0]), log
         )
-        return _buildAirwaySegmentation(array, ijkToRAS, segmentationNode.GetName(), log)
+        node = _buildAirwaySegmentation(array, ijkToRAS, segmentationNode.GetName(), log)
+        _applyDisplaySmoothing(node, options.get("smoothingFactor", 0.0))
+        return node
     finally:
         slicer.mrmlScene.RemoveNode(labelmapNode)
 
@@ -296,6 +335,132 @@ def removeSmallIslands(array, minSizeMm3, voxelVolumeMm3, log=None):
         removed = count - len(keptLabels)
         _log(log, "Remove small islands: dropped %d component(s) < %d voxels." % (removed, minVoxels))
     return cleaned
+
+
+def _volumeArrayLike(volumeNode, referenceArray):
+    """Grey-level volume array aligned to the airway labelmap grid, or None if unavailable."""
+    if volumeNode is None:
+        return None
+    try:
+        vol = slicer.util.arrayFromVolume(volumeNode)
+    except Exception:  # noqa: BLE001
+        return None
+    return vol if vol is not None and vol.shape == referenceArray.shape else None
+
+
+def _rasComponentField(shape, ijkToRAS, rasRow):
+    """Per-voxel value of one RAS component (0=R, 1=A, 2=S) over a KJI array of given shape.
+
+    The affine is separable, so the field is built from three 1-D ramps instead of a full
+    matrix product per voxel. Array axes are KJI, hence the K/J/I coefficients are columns
+    2/1/0 of the chosen RAS row.
+    """
+    nK, nJ, nI = shape
+    row = ijkToRAS[rasRow]
+    kRamp = np.arange(nK) * row[2]
+    jRamp = np.arange(nJ) * row[1]
+    iRamp = np.arange(nI) * row[0]
+    return row[3] + kRamp[:, None, None] + jRamp[None, :, None] + iRamp[None, None, :]
+
+
+def computeExternalAirMask(volumeArray, airwayArray, ijkToRAS, voxelVolumeMm3, log=None,
+                           minRegionMm3=DEFAULT_MIN_EXTERNAL_AIR_MM3):
+    """Segment the ambient air in front of the face as a binary mask on the airway grid.
+
+    The air threshold is self-calibrated from the intensities under the known airway mask, so
+    it holds whether the volume is in Hounsfield units (air ~ -1000) or intensity-shifted
+    (air ~ 0). Ambient air is taken as the air components touching the volume border, clipped
+    to the region anterior to the airway (the 'front of the face'), with the airway itself and
+    negligible specks removed. Returns a uint8 array; an all-zero array means 'not found'.
+    """
+    if volumeArray is None:
+        _log(log, "External air skipped: grey-level volume not available on the airway grid.")
+        return np.zeros_like(airwayArray, dtype=np.uint8)
+    try:
+        from scipy import ndimage
+    except Exception as exc:  # noqa: BLE001
+        _log(log, "External air skipped; scipy unavailable: " + str(exc))
+        return np.zeros_like(airwayArray, dtype=np.uint8)
+
+    airwayVals = volumeArray[airwayArray > 0]
+    if airwayVals.size == 0:
+        return np.zeros_like(airwayArray, dtype=np.uint8)
+    # Upper bound of the airway (air) intensity distribution -> everything this dark is air-like.
+    threshold = float(airwayVals.mean() + 2.0 * (airwayVals.std() + 1e-6))
+    airMask = volumeArray <= threshold
+
+    labeled, count = ndimage.label(airMask)
+    if count == 0:
+        return np.zeros_like(airwayArray, dtype=np.uint8)
+    borderLabels = set()
+    for face in (labeled[0], labeled[-1], labeled[:, 0], labeled[:, -1], labeled[:, :, 0], labeled[:, :, -1]):
+        borderLabels.update(int(v) for v in np.unique(face))
+    borderLabels.discard(0)
+    if not borderLabels:
+        return np.zeros_like(airwayArray, dtype=np.uint8)
+    external = np.isin(labeled, list(borderLabels))
+    external[airwayArray > 0] = False  # never double-count the airway lumen
+
+    # Clip to the front of the face: keep voxels anterior to the airway's mid A-coordinate.
+    try:
+        aField = _rasComponentField(volumeArray.shape, ijkToRAS, 1)  # RAS 'A' (anterior +)
+        airwayA = aField[airwayArray > 0]
+        if airwayA.size:
+            external &= aField >= float(np.median(airwayA))
+    except Exception as exc:  # noqa: BLE001
+        _log(log, "External air: anterior clip skipped (%s); keeping full ambient air." % exc)
+
+    minVox = int(np.ceil(float(minRegionMm3) / max(float(voxelVolumeMm3), 1e-6)))
+    if minVox > 1:
+        lab2, c2 = ndimage.label(external)
+        if c2 > 0:
+            sizes = np.bincount(lab2.ravel())
+            sizes[0] = 0
+            keep = np.where(sizes >= minVox)[0]
+            external = np.isin(lab2, keep)
+    result = external.astype(np.uint8)
+    _log(log, "External face air: %d voxels (air threshold <= %.1f)." % (int(result.sum()), threshold))
+    return result
+
+
+def _addExternalAirSegment(segmentationNode, externalArray, ijkToRAS, log=None):
+    """Import the external-air mask as a second, distinctly coloured segment in the node."""
+    tmp = slicer.util.addVolumeFromArray(
+        externalArray.astype(np.uint8), ijkToRAS=ijkToRAS, name="external_air_tmp",
+        nodeClassName="vtkMRMLLabelMapVolumeNode",
+    )
+    try:
+        segmentation = segmentationNode.GetSegmentation()
+        beforeIds = set(_segmentIds(segmentation))
+        slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(tmp, segmentationNode)
+        newIds = [sid for sid in _segmentIds(segmentation) if sid not in beforeIds]
+        if not newIds:
+            _log(log, "External air import produced no segment.")
+            return
+        segment = segmentation.GetSegment(newIds[0])
+        segment.SetName(EXTERNAL_AIR_SEGMENT_NAME)
+        segment.SetColor(*EXTERNAL_AIR_SEGMENT_COLOR)
+        displayNode = segmentationNode.GetDisplayNode()
+        if displayNode is not None:
+            displayNode.SetSegmentOpacity3D(newIds[0], 0.4)
+        segmentationNode.CreateClosedSurfaceRepresentation()
+        _log(log, "External air added as a separate segment.")
+    finally:
+        slicer.mrmlScene.RemoveNode(tmp)
+
+
+def _applyDisplaySmoothing(segmentationNode, factor):
+    """Set the closed-surface smoothing factor (0-1) and rebuild the surface for display/export."""
+    try:
+        factor = float(factor)
+    except Exception:  # noqa: BLE001
+        return
+    try:
+        segmentationNode.GetSegmentation().SetConversionParameter("Smoothing factor", str(factor))
+        segmentationNode.RemoveClosedSurfaceRepresentation()
+        segmentationNode.CreateClosedSurfaceRepresentation()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def extendBinaryArray(array, referenceNode, extensionMm, direction, log=None):

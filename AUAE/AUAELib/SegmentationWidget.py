@@ -4,11 +4,13 @@ This is based on capenaka/SlicerUpperAirwaySegmentator. The upstream automatic n
 segmentation core (input selection, weight download, inference through SlicerNNUNetLib) and
 the multi-format export (STL/OBJ/NIFTI) are kept as-is. The changes are:
 
-  * the embedded Segment Editor (qMRMLSegmentEditorWidget) and its surface-smoothing slider
-    are removed; island cleanup is done in NumPy instead (see AirwayExtension);
-  * segmentation and airway extension are two separate steps: "Apply" segments and cleans the
-    mask, then "Run airway extension" extends the selected segmentation, so the user can
-    refine the segmentation in between;
+  * automatic island cleanup is done in NumPy during the segmentation step (see
+    AirwayExtension), replacing the upstream "Islands" effect; a non-destructive surface
+    smoothing slider controls the exported mesh;
+  * segmentation, refinement and airway extension are three separate steps: "Apply" segments
+    and cleans the mask; an embedded Segment Editor (qMRMLSegmentEditorWidget), placed between
+    segmentation and extension, lets the user refine the mask (paint, erase, islands, mask
+    smoothing); then "Run airway extension" extends the selected segmentation;
   * a "Batch processing" section runs a JSON-defined list of volumes into per-volume output
     subfolders;
   * a "Dependencies & CUDA" section reports required-vs-installed versions and installs
@@ -48,6 +50,8 @@ class SegmentationWidget(qt.QWidget):
         super().__init__(parent)
         self.logic = logic or self._createSlicerSegmentationLogic()
         self._prevSegmentationNode = None
+        self.segmentEditorNode = None
+        self.segmentEditorWidget = None
 
         self.inputSelector = slicer.qMRMLNodeComboBox(self)
         self.inputSelector.nodeTypes = ["vtkMRMLScalarVolumeNode"]
@@ -109,6 +113,7 @@ class SegmentationWidget(qt.QWidget):
         layout.addWidget(self.stopWidget)
 
         addInCollapsibleLayout(self._createPostprocessWidget(), layout, "Post-processing", isCollapsed=False)
+        addInCollapsibleLayout(self._createEditorWidget(), layout, "Segment editor (refine)", isCollapsed=False)
         addInCollapsibleLayout(self._createExtensionWidget(), layout, "Airway extension", isCollapsed=False)
 
         exportWidget = self._createExportWidget()
@@ -143,10 +148,85 @@ class SegmentationWidget(qt.QWidget):
 
         self.keepLargestCheckBox = qt.QCheckBox(widget)
         self.keepLargestCheckBox.setChecked(False)
-        self.keepLargestCheckBox.setToolTip("Keep only the single largest connected component. Mutually exclusive with 'Remove small islands'.")
+        self.keepLargestCheckBox.setToolTip(
+            "Keep only the single largest connected component. NOTE: for the upper airway this "
+            "drops the nasal cavity and sinuses (they are separate from the pharynx). Leave off "
+            "unless you only want the pharyngeal airway."
+        )
         self.keepLargestCheckBox.toggled.connect(self._onKeepLargestToggled)
         form.addRow("Keep largest island only", self.keepLargestCheckBox)
+
+        # Optional second segment: the ambient air in front of the face, for flow modelling.
+        self.externalAirCheckBox = qt.QCheckBox(widget)
+        self.externalAirCheckBox.setChecked(False)
+        self.externalAirCheckBox.setToolTip(
+            "Also segment the ambient air in front of the face as a second segment. For flow "
+            "(CFD) modelling this is the inlet volume the air enters through (nostrils / mouth)."
+        )
+        self.externalAirCheckBox.toggled.connect(self._onExternalAirToggled)
+        form.addRow("Segment external face air", self.externalAirCheckBox)
+
+        self.mergeExternalAirCheckBox = qt.QCheckBox(widget)
+        self.mergeExternalAirCheckBox.setChecked(False)
+        self.mergeExternalAirCheckBox.setEnabled(False)
+        self.mergeExternalAirCheckBox.setToolTip(
+            "Merge the external air and the airway into a single segment (one continuous fluid "
+            "domain) instead of keeping them as two separate segments."
+        )
+        form.addRow("Merge external air into airway", self.mergeExternalAirCheckBox)
+
+        # Surface smoothing of the exported mesh (3D view + STL/OBJ), non-destructive.
+        self.smoothingSlider = ctk.ctkSliderWidget(widget)
+        self.smoothingSlider.minimum = 0.0
+        self.smoothingSlider.maximum = 1.0
+        self.smoothingSlider.singleStep = 0.1
+        self.smoothingSlider.decimals = 2
+        self.smoothingSlider.value = 0.3
+        self.smoothingSlider.setToolTip(
+            "Surface smoothing of the exported mesh (0 = raw voxels, 1 = very smooth). Applies to "
+            "the 3D model and STL/OBJ, not to the labelmap. For mask-level smoothing use the "
+            "editor's Smoothing effect (Median or Closing)."
+        )
+        self.smoothingSlider.connect("valueChanged(double)", self._onSmoothingChanged)
+        form.addRow("Surface smoothing", self.smoothingSlider)
         return widget
+
+    def _createEditorWidget(self):
+        # Embedded Segment Editor between segmentation and extension, so the mask can be refined
+        # (paint, erase, islands, smoothing) before extending it.
+        self.segmentEditorWidget = slicer.qMRMLSegmentEditorWidget()
+        self.segmentEditorWidget.setMRMLScene(slicer.mrmlScene)
+        try:
+            self.segmentEditorWidget.setMaximumNumberOfUndoStates(10)
+            self.segmentEditorWidget.setSwitchToSegmentationsButtonVisible(False)
+        except Exception:  # noqa: BLE001
+            pass
+        return self.segmentEditorWidget
+
+    def _setEditorSourceVolume(self, volumeNode):
+        if self.segmentEditorWidget is None:
+            return
+        try:
+            self.segmentEditorWidget.setSourceVolumeNode(volumeNode)
+        except Exception:  # noqa: BLE001
+            try:
+                self.segmentEditorWidget.setMasterVolumeNode(volumeNode)
+            except Exception:  # noqa: BLE001
+                pass
+
+    @staticmethod
+    def _applySmoothing(segmentationNode, factor):
+        try:
+            segmentationNode.GetSegmentation().SetConversionParameter("Smoothing factor", str(float(factor)))
+            segmentationNode.RemoveClosedSurfaceRepresentation()
+            segmentationNode.CreateClosedSurfaceRepresentation()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _onSmoothingChanged(self, value):
+        seg = self.getCurrentSegmentationNode()
+        if seg and seg.GetSegmentation().GetNumberOfSegments() > 0:
+            self._applySmoothing(seg, float(value))
 
     def _createExtensionWidget(self):
         # Step 2, decoupled from segmentation: extends the currently selected segmentation
@@ -226,6 +306,11 @@ class SegmentationWidget(qt.QWidget):
     # ------------------------------------------------------------------ lifecycle -----
     def __del__(self):
         slicer.mrmlScene.RemoveObserver(self.sceneCloseObserver)
+        if self.segmentEditorNode is not None:
+            try:
+                slicer.mrmlScene.RemoveNode(self.segmentEditorNode)
+            except Exception:  # noqa: BLE001
+                pass
         super().__del__()
 
     def onSceneChanged(self, *_, doStopInference=True):
@@ -233,6 +318,15 @@ class SegmentationWidget(qt.QWidget):
             self.onStopClicked()
         self.processedVolumes = {}
         self._prevSegmentationNode = None
+        # (re)create the segment editor parameter node for the fresh scene
+        if self.segmentEditorNode is not None:
+            try:
+                slicer.mrmlScene.RemoveNode(self.segmentEditorNode)
+            except Exception:  # noqa: BLE001
+                pass
+        self.segmentEditorNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentEditorNode")
+        if self.segmentEditorWidget is not None:
+            self.segmentEditorWidget.setMRMLSegmentEditorNode(self.segmentEditorNode)
         self._initSlicerDisplay()
 
     @staticmethod
@@ -273,7 +367,15 @@ class SegmentationWidget(qt.QWidget):
         self.segmentationNodeSelector.setEnabled(isVisible)
 
     def _ensureReadyToRun(self):
-        """Autonomous preflight: install/validate dependencies, then make the logic available."""
+        """Autonomous preflight: verbose report, GPU/torch conflict guard, then install."""
+        Dependencies.report(self.onProgressInfo)
+        ts = Dependencies.torchStatus()
+        if ts.get("archStatus") == "warn" and self.deviceComboBox.currentText.strip().lower() != "cpu":
+            slicer.util.errorDisplay(
+                "GPU / torch architecture conflict:\n\n" + (ts.get("archMessage") or "") +
+                "\n\nSet 'Inference device: CPU' to run anyway, or install a matching torch build."
+            )
+            return False
         ok, needsRestart = Dependencies.ensure(self.onProgressInfo, askConfirmation=True)
         if needsRestart:
             slicer.util.infoDisplay("The PyTorch extension was installed. Please restart 3D Slicer, then run again.")
@@ -327,6 +429,7 @@ class SegmentationWidget(qt.QWidget):
         self.applyButton.setEnabled(volumeNode is not None)
         slicer.util.setSliceViewerLayers(background=volumeNode)
         slicer.util.resetSliceViews()
+        self._setEditorSourceVolume(volumeNode)
         self._restoreProcessedSegmentation()
 
     def _restoreProcessedSegmentation(self):
@@ -340,12 +443,16 @@ class SegmentationWidget(qt.QWidget):
             self.processedVolumes[volumeNode] = segmentationNode
 
     def updateSegmentationSelection(self, *_):
-        """Toggle display of the selected segmentation (no segment editor involved)."""
+        """Toggle display of the selected segmentation and point the segment editor at it."""
         if self._prevSegmentationNode:
             self._prevSegmentationNode.SetDisplayVisibility(False)
         segmentationNode = self.getCurrentSegmentationNode()
         self._prevSegmentationNode = segmentationNode
         self._initializeSegmentationNodeDisplay(segmentationNode)
+        # Wire the embedded editor (refine step) to the current segmentation + source volume.
+        if self.segmentEditorWidget is not None:
+            self.segmentEditorWidget.setSegmentationNode(segmentationNode)
+            self._setEditorSourceVolume(self.getCurrentVolumeNode())
 
     def _initializeSegmentationNodeDisplay(self, segmentationNode):
         if not segmentationNode:
@@ -402,6 +509,9 @@ class SegmentationWidget(qt.QWidget):
         options = AirwayExtension.defaultOptions()
         options["removeSmallIslands"] = bool(self.removeIslandsCheckBox.checked)
         options["keepLargestIsland"] = bool(self.keepLargestCheckBox.checked)
+        options["segmentExternalAir"] = bool(self.externalAirCheckBox.checked)
+        options["mergeExternalAir"] = bool(self.mergeExternalAirCheckBox.checked)
+        options["smoothingFactor"] = float(self.smoothingSlider.value)
         options["extend"] = False  # extension is an explicit, separate step
         return options
 
@@ -409,6 +519,7 @@ class SegmentationWidget(qt.QWidget):
         return {
             "direction": self.extendDirectionComboBox.currentText,
             "lengthMm": float(self.extendLengthSpinBox.value),
+            "smoothingFactor": float(self.smoothingSlider.value),
         }
 
     @staticmethod
@@ -423,7 +534,8 @@ class SegmentationWidget(qt.QWidget):
         if not segmentationNode:
             return
         self._initializeSegmentationNodeDisplay(segmentationNode)
-        segmentationNode.GetSegmentation().SetConversionParameter("Smoothing factor", "0.0")
+        # Apply the user-chosen surface smoothing factor (0 = raw voxel surface).
+        self._applySmoothing(segmentationNode, float(self.smoothingSlider.value))
         slicer.util.resetThreeDViews()
 
     def onRunExtensionClicked(self):
@@ -543,6 +655,12 @@ class SegmentationWidget(qt.QWidget):
     def _onKeepLargestToggled(self, checked):
         if checked and self.removeIslandsCheckBox.checked:
             self.removeIslandsCheckBox.setChecked(False)
+
+    def _onExternalAirToggled(self, checked):
+        # The merge flag only makes sense when the external air is being segmented.
+        self.mergeExternalAirCheckBox.setEnabled(bool(checked))
+        if not checked:
+            self.mergeExternalAirCheckBox.setChecked(False)
 
     # ------------------------------------------------------------------ dependencies --
     def onCheckDependenciesClicked(self):

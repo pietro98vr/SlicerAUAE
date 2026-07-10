@@ -18,17 +18,25 @@ Automatic upper-airway segmentation on CT and CBCT in 3D Slicer, with mask exten
 
 AUAE takes a CT or CBCT volume (HU calibrated), runs the upstream nnU-Net model to segment the upper airway
 (nasal cavity, nasopharynx, oropharynx), cleans the mask, and lets you export it as STL, OBJ,
-or NIFTI. On top of the upstream extension, AUAE adds four things:
+or NIFTI. On top of the upstream extension, AUAE adds:
 
+- **A three-step workflow:** *segment* (Apply), *refine*, *extend*. Segmentation and airway
+  extension are separate steps, so the mask can be corrected in between.
+- **Embedded Segment Editor:** a Slicer Segment Editor sits between segmentation and
+  extension for manual refinement (paint, erase, islands, mask smoothing) before you extend.
 - **Airway extension for flow modelling:** extend the final mask past the scanned field of
   view by repeating its terminal slice, inferiorly or superiorly, by a set number of
   millimetres. This closes the airway domain for downstream flow / CFD work.
+- **External face-air segment:** optionally segment the ambient air in front of the face as a
+  second segment (the inlet volume for CFD), with a flag to merge it and the airway into a
+  single fluid-domain segment.
+- **Two island-cleanup options** that cannot both be on: *remove small islands* or *keep the
+  largest island only*, plus a non-destructive **surface-smoothing** slider for the exported mesh.
 - **Batch processing:** point a JSON template at a list of volumes and get one output
   subfolder per case, each with its segmentation and meshes.
-- **Two island-cleanup options** that cannot both be on: *remove small islands* or *keep the
-  largest island only*.
-- **Dependency preflight:** It installs and checks everything before run, reports the
-  installed versions, and tells whether inference will use the GPU or fall back to CPU.
+- **Dependency preflight:** it installs and checks everything before a run, reports the
+  installed versions, and warns before a run when the GPU is newer than the installed torch
+  build supports (for example an RTX 50-series), instead of crashing mid-inference.
 
 ## Requirements
 
@@ -112,13 +120,16 @@ restart. It runs the nnU-Net inference and pulls in the PyTorch extension.
 
 ## Use the extension
 
-### One volume (two steps)
+### One volume (three steps)
 
 1. Load a CT or CBCT and pick it as the input.
-2. In **Post-processing**, choose an island option, then click **Apply** to segment (step 1).
-3. Optionally refine the segmentation with Slicer's Segment Editor.
+2. In **Post-processing**, choose an island option (and, if you want a CFD inlet, *Segment
+   external face air*, optionally *Merge external air into airway*), then click **Apply** to
+   segment (step 1).
+3. In **Segment editor (refine)**, correct the mask if needed with the paint, erase, islands,
+   or smoothing tools (step 2). Use the **Surface smoothing** slider to smooth the exported mesh.
 4. In **Airway extension**, set a direction (inferior or superior) and a length, then click
-   **Run airway extension** to extend the selected segmentation (step 2).
+   **Run airway extension** to extend the selected segmentation (step 3).
 5. Export the result from **Export segmentation**.
 
 ### A batch
@@ -126,7 +137,7 @@ restart. It runs the nnU-Net inference and pulls in the PyTorch extension.
 1. Open **Batch processing**. It points to the bundled template at
    `Resources/batch_template.json`.
 2. Copy the template, list your volumes under `volumes`, and set `output_root`, the export
-   formats, the island option, and the extension block.
+   formats, the island / external-air / smoothing options, and the extension block.
 3. Click **Run batch**. Each volume is written to its own subfolder under `output_root`.
 
 Every field is described inside the template file.

@@ -63,8 +63,8 @@ This plugin follows Slicer's commit message standard :
 * `WIP:` Work In Progress not ready for merge
 
 The body of the message should clearly describe the motivation of the commit
-(**what**, **why**, and **how**). In order to ease the task of reviewing commits, the message body should follow the
-following guidelines:
+(**what**, **why**, and **how**). To make commits easier to review, the message body should follow these
+guidelines:
 
 1. Leave a blank line between the subject and the body. This helps `git log` and `git rebase` work nicely, and allows to
    smooth generation of release notes.
