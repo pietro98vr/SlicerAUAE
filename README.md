@@ -16,24 +16,29 @@ Automatic upper-airway segmentation on CT and CBCT in 3D Slicer, with mask exten
 
 ## What it does
 
-AUAE takes a CT or CBCT volume (HU calibrated), runs the upstream nnU-Net model to segment the upper airway
+AUAE takes a CT or CBCT volume, runs the upstream nnU-Net model to segment the upper airway
 (nasal cavity, nasopharynx, oropharynx), cleans the mask, and lets you export it as STL, OBJ,
-or NIFTI. On top of the upstream extension, AUAE adds:
+NIFTI, or NRRD. On top of the upstream extension, AUAE adds:
 
 - **A three-step workflow:** *segment* (Apply), *refine*, *extend*. Segmentation and airway
   extension are separate steps, so the mask can be corrected in between.
 - **Embedded Segment Editor:** a Slicer Segment Editor sits between segmentation and
   extension for manual refinement (paint, erase, islands, mask smoothing) before you extend.
-- **Airway extension for flow modelling:** extend the final mask past the scanned field of
-  view by repeating its terminal slice, inferiorly or superiorly, by a set number of
-  millimetres. This closes the airway domain for downstream flow / CFD work.
+- **Frontal sinus recovery:** on by default. The model often drops the paranasal sinuses;
+  AUAE finds the air enclosed inside the head and folds it back into the airway, while removing
+  the smaller cephalostat air bubbles by size.
+- **Inferior airway extension for flow modelling:** grow the final mask towards the neck, past
+  the scanned field of view, by a set number of millimetres. This closes the airway domain for
+  downstream flow / CFD work. The direction is always inferior; only the length is variable.
 - **External face-air segment:** optionally segment the ambient air in front of the face as a
-  second segment (the inlet volume for CFD), with a flag to merge it and the airway into a
-  single fluid-domain segment.
-- **Two island-cleanup options** that cannot both be on: *remove small islands* or *keep the
-  largest island only*, plus a non-destructive **surface-smoothing** slider for the exported mesh.
-- **Batch processing:** point a JSON template at a list of volumes and get one output
-  subfolder per case, each with its segmentation and meshes.
+  second segment (the inlet volume for CFD), with a flag to merge it into a single fluid-domain
+  segment. When merged, the extension is applied to the airway before the merge.
+- **Island cleanup and smoothing:** *remove small islands* or *keep the largest island only*
+  (mutually exclusive), plus a non-destructive **surface-smoothing** slider for the exported mesh.
+- **Flexible export:** STL, OBJ, NIFTI, NRRD, and independent targets (airway, external air, or a
+  single merged file).
+- **Batch processing:** a classic folder-in / folder-out run, or a JSON template, writing one
+  output subfolder per case.
 - **Dependency preflight:** it installs and checks everything before a run, reports the
   installed versions, and warns before a run when the GPU is newer than the installed torch
   build supports (for example an RTX 50-series), instead of crashing mid-inference.
@@ -118,29 +123,203 @@ restart. It runs the nnU-Net inference and pulls in the PyTorch extension.
 - **Weights fail to download:** check the network connection. The weights come from the
   upstream GitHub release.
 
+#### Newer GPUs (RTX 50-series / sm_120) and the PyTorch build
+
+This one trips up a lot of people, so read it before you fight the GPU.
+
+**Symptom.** At startup, or when AUAE runs its preflight, you see a message like:
+
+> NVIDIA GeForce RTX 5070 Ti with CUDA capability sm_120 is not compatible with the current
+> PyTorch installation. The current PyTorch install supports CUDA capabilities sm_50 sm_60
+> sm_70 sm_75 sm_80 sm_86 sm_90.
+
+AUAE detects this and blocks the GPU run on purpose, so the inference does not crash halfway
+with a "no kernel image is available" error. Until it is fixed, the GPU is unusable and you fall
+back to CPU (slow).
+
+**Cause.** The RTX 50-series (NVIDIA Blackwell) is compute capability **sm_120**. The PyTorch
+build that Slicer's PyTorch extension installs by default is compiled for older architectures,
+up to sm_90, so it has no kernels for your card. Only a PyTorch built for **CUDA 12.8** (torch
+**2.7 or newer**) ships the sm_120 kernels.
+
+**Fix on Windows.** Install a CUDA 12.8 torch build from inside Slicer:
+
+1. Open the **PyTorch Utils** module (it comes with the PyTorch extension).
+2. Uninstall the current torch there. Note where Slicer keeps its packages first, by running this
+   once in the Python console:
+   ```python
+   import sysconfig; print(sysconfig.get_paths()["purelib"])
+   ```
+3. **Close Slicer, then delete the leftover torch folders by hand.** `pip uninstall` often leaves
+   directories behind, and if the old `torchgen` folder (and `torch`, `torchvision`, `functorch`)
+   is still there, the new install fails with a `torchgen` error. In the folder printed above,
+   remove `torch`, `torchgen`, `torchvision`, `functorch`, their matching `*.dist-info` folders,
+   and any half-removed leftover that pip renamed to start with a tilde (for example a folder
+   named `~orch`). This step is the one most people miss.
+4. Reopen Slicer. In PyTorch Utils, instead of letting it search automatically, choose the
+   **CUDA 12.8 (cu128)** backend and install. It is a large download (around 4 GB), so give it
+   time. From the Python console the same thing is, for example:
+   ```python
+   import PyTorchUtils
+   PyTorchUtils.PyTorchUtilsLogic().installTorch(askConfirmation=True, forceComputationBackend="cu128")
+   ```
+5. Restart Slicer, open AUAE, expand **Dependencies & CUDA**, and click **Check dependencies**.
+   The report should now list `sm_120` under the torch architectures and say
+   `GPU inference AVAILABLE`.
+
+To confirm by hand, run `import torch; torch.cuda.get_arch_list()` in the Python console; the
+list must include `sm_120`.
+
+**Caveat on Linux.** As of mid-2025 the official Slicer Linux package is built on an old base
+(CentOS 7, glibc 2.17). The torch 2.7+ wheels that carry sm_120 need a newer glibc (2.28), so
+they do not run on the packaged Slicer. On Linux an RTX 50-series card therefore cannot be used
+from the stock Slicer package until its base is updated; use Windows, build a compatible torch
+yourself, or run on CPU.
+
+**While you wait.** Set **Inference device** to **CPU** in Dependencies & CUDA. A run takes up
+to about an hour on CPU, but it works and produces the same result.
+
 ## Use the extension
 
-### One volume (three steps)
+The module panel is laid out in the order you use it: pick the input, segment, refine, extend,
+export. Two collapsed sections at the bottom hold batch processing and the dependency setup.
 
-1. Load a CT or CBCT and pick it as the input.
-2. In **Post-processing**, choose an island option (and, if you want a CFD inlet, *Segment
-   external face air*, optionally *Merge external air into airway*), then click **Apply** to
-   segment (step 1).
-3. In **Segment editor (refine)**, correct the mask if needed with the paint, erase, islands,
-   or smoothing tools (step 2). Use the **Surface smoothing** slider to smooth the exported mesh.
-4. In **Airway extension**, set a direction (inferior or superior) and a length, then click
-   **Run airway extension** to extend the selected segmentation (step 3).
-5. Export the result from **Export segmentation**.
+### 1. Input and segmentation
 
-### A batch
+Choose the CT or CBCT in the first selector. The second selector picks the segmentation node to
+write into; the "create new segmentation" entry is available, so you can keep several results in
+one scene.
 
-1. Open **Batch processing**. It points to the bundled template at
-   `Resources/batch_template.json`.
-2. Copy the template, list your volumes under `volumes`, and set `output_root`, the export
-   formats, the island / external-air / smoothing options, and the extension block.
-3. Click **Run batch**. Each volume is written to its own subfolder under `output_root`.
+Press **Apply** to run the model. It runs the nnU-Net inference, then hands the raw mask to the
+post-processing. The **Post-processing** section controls the cleanup:
 
-Every field is described inside the template file.
+- **Remove small islands** drops components below a physical-volume threshold. On by default.
+- **Keep largest island only** keeps a single component. For the upper airway this drops the
+  nasal cavity and the sinuses, so leave it off unless you want the pharyngeal airway alone. The
+  two island options are mutually exclusive.
+- **Attempt frontal sinus segmentation** is on by default. It recovers the paranasal sinuses the
+  model misses and folds them into the airway, dropping the smaller cephalostat air bubbles by
+  size first.
+- **Segment external face air** adds a second segment with the ambient air in front of the face
+  (the CFD inlet). When it is on, **Merge external air into airway** unions the two into one
+  fluid-domain segment.
+- **Surface smoothing** sets the mesh smoothing factor, from 0 (raw voxels) to 1 (very smooth). It
+  changes the 3D model and the STL/OBJ output, not the labelmap.
+
+### 2. Refinement
+
+The **Segment editor (refine)** section is a standard Slicer Segment Editor between segmentation
+and extension. Use it to paint, erase, or clean the mask. For airway masks, the Smoothing effect
+with Median removes voxel noise while keeping the lumen, and Closing fills small holes. Edits here
+are preserved, because the extension is a separate step.
+
+### 3. Inferior extension
+
+The **Airway extension** section grows the final mask towards the neck so the domain is closed for
+flow work. The direction is always inferior, so only the length in millimetres is variable. Press
+**Run airway extension** to apply it to the selected segmentation in place.
+
+### 4. Export
+
+Pick the formats and what to export, then press **Export**:
+
+- Formats: STL and OBJ are surface meshes; NIFTI and NRRD are labelmaps.
+- Targets are independent: **Export airway**, **Export external air**, and **Export merged** (a
+  single file with all segments together). A target with no matching segment is skipped.
+
+## How the post-processing works
+
+All of this lives in `AirwayExtension` and runs on NumPy arrays in Slicer's KJI order. The mask is
+exported to a labelmap on the reference volume geometry first, so the full slice stack is available.
+
+### Island cleanup
+
+`keepLargestConnectedComponent` keeps the single largest component. `removeSmallIslands` drops
+components below a volume threshold in cubic millimetres, so the threshold is correct at any voxel
+spacing. Cleanup runs on the airway before any sinus or external air is considered.
+
+### The head-envelope decomposition
+
+The sinus recovery and the external air share one idea. `_airThresholdFromAirway` reads the
+intensities under the known airway mask and sets an air threshold from them. Because the airway
+lumen is air, this holds whether the volume is in Hounsfield units (air near -1000) or
+intensity-shifted (air near 0), with no fixed value assumed.
+
+`_sealedHeadMask` then builds a solid head: everything brighter than the threshold is tissue or
+bone, the largest such component is the patient, a morphological closing seals the narrow openings
+(nostrils, mouth, thin sinus ducts), and hole-filling turns the internal airspace into a solid
+mask. Inside that envelope sit the sinuses and the airway; outside it is ambient air. From this
+single split:
+
+- `computeInternalAirCavities` takes the air inside the envelope that is not already airway (the
+  dropped sinuses), removes components below `min_internal_air_mm3` (250 mm^3 by default, which
+  clears the cephalostat bubbles), and the result is unioned into the airway.
+- `computeExternalAirMask` takes the air outside the envelope, keeps the border-touching
+  components, and clips them to the region in front of the airway. Because it works from the
+  outside of the sealed head, the frontal sinuses cannot leak into it.
+
+### Extension and the merged case
+
+The extension is applied to the airway alone. `extendBinaryArray` returns the extended array, the
+updated geometry, and the padding it added. When the external air is merged, it is unioned after
+the extension: `_padCompanionToExtendedGrid` pads it onto the extended grid so it keeps its
+position. This guarantees the caudal extension repeats the airway's terminal slice, never the
+external air, which can sit lower in the scan.
+
+## Batch processing
+
+The **Batch processing** section runs the same segmentation and post-processing over many volumes,
+with two paths.
+
+### Folder in, folder out (the classic way)
+
+Point **Input folder** at a folder of volumes and press **Run batch (folder)**. Every volume in it
+(`.nii`, `.nii.gz`, `.nrrd`, `.nhdr`, `.mha`, `.mhd`) is processed with the current Post-processing
+and Export settings, and each result goes to its own subfolder. **Output folder** is optional; when
+empty, results land in an `AUAE_output` folder beside the inputs.
+
+### Template (advanced)
+
+A JSON template gives explicit control. The bundled template at `Resources/batch_template.json`
+documents every field: `input_folder` or `volumes`, `output_root`, `export_formats` (STL, OBJ,
+NIFTI, NRRD), `export_targets` (airway, external, merged), the island options, `include_internal_air`
+with `min_internal_air_mm3`, `segment_external_air` and `merge_external_air`, `smoothing_factor`,
+and the `extension` block. `mode` is `segment` to run the model, or `extend` to rerun only the
+extension on existing segmentation files (no model or GPU needed).
+
+## Module and function reference
+
+- **AirwayExtension** is the interface-free array logic. `postprocessSegmentation` is the single
+  source of truth for the segmentation step (island cleanup, sinus recovery, external air,
+  inferior extension, optional merge). `extendSegmentation` is the separate extension step and
+  preserves manual edits. The head-envelope functions (`_airThresholdFromAirway`,
+  `_sealedHeadMask`, `computeInternalAirCavities`, `computeExternalAirMask`) and the geometry
+  helpers (`extendBinaryArray`, `_padCompanionToExtendedGrid`, `resolveExtensionSideForDirection`)
+  are described above.
+- **SegmentationWidget** is the module panel and the glue to the nnU-Net logic. It builds the
+  three-step layout, collects the options, wires the embedded editor, and drives export and batch.
+  `exportSegmentation(node, folder, formats, targets)` writes the requested segments in the
+  requested formats. `_ensureReadyToRun` prints the dependency report and blocks a GPU run on the
+  architecture conflict described in Troubleshooting.
+- **BatchProcessor** holds `listVolumesInFolder`, `folderConfig`, `loadConfig`, and the
+  `BatchProcessor.run` / `_runExtend` drivers.
+- **Dependencies** is the autonomous preflight: `report` prints a required-versus-installed table
+  and a CUDA verdict, `ensure` installs torch and nnU-Net through the NNUNet and PyTorch
+  extensions, and `torchStatus` / `_archCompatibility` compare the GPU against the torch build.
+- **PythonDependencyChecker** downloads the model weights from the upstream GitHub release.
+
+## Notes and caveats
+
+- **Intensity domain.** The model expects CT-like Hounsfield units and normalises with a fixed
+  window. A CBCT with air near 0 rather than near -1000 falls outside that window and is
+  under-segmented, which is the usual reason turbinates and sinuses go missing. The sinus recovery
+  helps, but a volume already in Hounsfield units, or a model trained on your own CBCT domain, is
+  the reliable path.
+- **GPU.** See Troubleshooting for the RTX 50-series / sm_120 case. The preflight reports it and
+  blocks the GPU run; set the device to CPU to run anyway.
+- **Cephalostat bubbles.** The bubble threshold is a best-effort size filter. If a hypoplastic
+  frontal sinus is smaller than expected, or a bubble is larger, adjust `min_internal_air_mm3` or
+  correct the mask in the editor.
 
 ## Credits
 

@@ -24,6 +24,7 @@ from pathlib import Path
 import ctk
 import qt
 import slicer
+import vtk
 
 from . import AirwayExtension
 from . import Dependencies
@@ -43,6 +44,15 @@ class ExportFormat(Flag):
     STL = auto()
     OBJ = auto()
     NIFTI = auto()
+    NRRD = auto()
+
+
+def _stringArray(items):
+    """Build a vtkStringArray from a list of strings (segment-id list for the export logic)."""
+    arr = vtk.vtkStringArray()
+    for value in items:
+        arr.InsertNextValue(value)
+    return arr
 
 
 class SegmentationWidget(qt.QWidget):
@@ -156,6 +166,17 @@ class SegmentationWidget(qt.QWidget):
         self.keepLargestCheckBox.toggled.connect(self._onKeepLargestToggled)
         form.addRow("Keep largest island only", self.keepLargestCheckBox)
 
+        # Recover the internal air cavities (paranasal sinuses) the model drops, back into the
+        # airway. These are air enclosed by the head, so they never belong to the external air.
+        self.internalAirCheckBox = qt.QCheckBox(widget)
+        self.internalAirCheckBox.setChecked(True)  # on by default: the model often drops the sinuses
+        self.internalAirCheckBox.setToolTip(
+            "Attempt to recover the frontal and other paranasal sinuses the model misses, by "
+            "thresholding the air enclosed inside the head and folding it into the airway. "
+            "Smaller cephalostat air bubbles near the frontal sinus are dropped automatically."
+        )
+        form.addRow("Attempt frontal sinus segmentation", self.internalAirCheckBox)
+
         # Optional second segment: the ambient air in front of the face, for flow modelling.
         self.externalAirCheckBox = qt.QCheckBox(widget)
         self.externalAirCheckBox.setChecked(False)
@@ -196,6 +217,11 @@ class SegmentationWidget(qt.QWidget):
         # (paint, erase, islands, smoothing) before extending it.
         self.segmentEditorWidget = slicer.qMRMLSegmentEditorWidget()
         self.segmentEditorWidget.setMRMLScene(slicer.mrmlScene)
+        # The parameter node must exist before any segmentation or source volume is assigned,
+        # otherwise the widget logs "need to set segment editor and segmentation nodes first"
+        # and the segments model complains about an invalid display node. Create it up front.
+        self.segmentEditorNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentEditorNode")
+        self.segmentEditorWidget.setMRMLSegmentEditorNode(self.segmentEditorNode)
         try:
             self.segmentEditorWidget.setMaximumNumberOfUndoStates(10)
             self.segmentEditorWidget.setSwitchToSegmentationsButtonVisible(False)
@@ -204,7 +230,11 @@ class SegmentationWidget(qt.QWidget):
         return self.segmentEditorWidget
 
     def _setEditorSourceVolume(self, volumeNode):
-        if self.segmentEditorWidget is None:
+        # A source volume can only be set once the editor has BOTH a parameter node and a
+        # segmentation node; setting it earlier triggers the VTK "need to set segment editor
+        # and segmentation nodes first" warning. Guard on all three conditions.
+        if (self.segmentEditorWidget is None or self.segmentEditorNode is None
+                or volumeNode is None or self.getCurrentSegmentationNode() is None):
             return
         try:
             self.segmentEditorWidget.setSourceVolumeNode(volumeNode)
@@ -234,55 +264,100 @@ class SegmentationWidget(qt.QWidget):
         widget = qt.QWidget()
         form = qt.QFormLayout(widget)
 
-        self.extendDirectionComboBox = qt.QComboBox(widget)
-        for direction in AirwayExtension.EXTENSION_DIRECTIONS:
-            self.extendDirectionComboBox.addItem(direction)
-        self.extendDirectionComboBox.setToolTip("Direction in which to extend the airway beyond the field of view.")
-        form.addRow("Direction", self.extendDirectionComboBox)
-
+        # The extension always runs inferiorly (towards the neck); only the length is variable.
         self.extendLengthSpinBox = ctk.ctkDoubleSpinBox(widget)
         self.extendLengthSpinBox.minimum = 0.0
         self.extendLengthSpinBox.maximum = 300.0
         self.extendLengthSpinBox.singleStep = 5.0
         self.extendLengthSpinBox.value = 100.0
         self.extendLengthSpinBox.suffix = " mm"
-        form.addRow("Length", self.extendLengthSpinBox)
+        self.extendLengthSpinBox.setToolTip("How far to extend the airway inferiorly (towards the neck), beyond the scan.")
+        form.addRow("Inferior length", self.extendLengthSpinBox)
 
         form.addRow(createButton(
             "Run airway extension", callback=self.onRunExtensionClicked, parent=widget,
-            toolTip="Extend the selected segmentation by repeating its terminal slice (step 2)."
+            toolTip="Extend the selected segmentation inferiorly by repeating its terminal slice (step 2)."
         ))
         return widget
 
     def _createExportWidget(self):
         exportWidget = qt.QWidget()
         exportLayout = qt.QFormLayout(exportWidget)
+
+        # Formats: STL/OBJ are surface meshes; NIFTI/NRRD are labelmaps.
         self.stlCheckBox = qt.QCheckBox(exportWidget)
         self.stlCheckBox.setChecked(True)
         self.objCheckBox = qt.QCheckBox(exportWidget)
         self.niftiCheckBox = qt.QCheckBox(exportWidget)
         self.niftiCheckBox.setChecked(True)
+        self.nrrdCheckBox = qt.QCheckBox(exportWidget)
         exportLayout.addRow("Export STL", self.stlCheckBox)
         exportLayout.addRow("Export OBJ", self.objCheckBox)
         exportLayout.addRow("Export NIFTI", self.niftiCheckBox)
+        exportLayout.addRow("Export NRRD", self.nrrdCheckBox)
+
+        # What to export: the airway, the external air, and/or a single merged file. Independent.
+        self.exportAirwayCheckBox = qt.QCheckBox(exportWidget)
+        self.exportAirwayCheckBox.setChecked(True)
+        self.exportAirwayCheckBox.setToolTip("Export the airway segment.")
+        self.exportExternalAirCheckBox = qt.QCheckBox(exportWidget)
+        self.exportExternalAirCheckBox.setToolTip("Export the external face-air segment (only present if it was segmented).")
+        self.exportMergedCheckBox = qt.QCheckBox(exportWidget)
+        self.exportMergedCheckBox.setToolTip("Export a single merged file containing all segments together.")
+        exportLayout.addRow("Export airway", self.exportAirwayCheckBox)
+        exportLayout.addRow("Export external air", self.exportExternalAirCheckBox)
+        exportLayout.addRow("Export merged (single)", self.exportMergedCheckBox)
+
         exportLayout.addRow(createButton("Export", callback=self.onExportClicked, parent=exportWidget))
         return exportWidget
 
     def _createBatchWidget(self):
         widget = qt.QWidget()
         form = qt.QFormLayout(widget)
+
+        # Classic folder-in / folder-out: point at a folder of volumes, get a mirrored output
+        # folder. Uses the current Post-processing and Export settings.
+        self.batchInputFolderLineEdit = qt.QLineEdit(widget)
+        self.batchInputFolderLineEdit.setToolTip(
+            "Folder of input volumes (.nii/.nii.gz/.nrrd/.mha...). Every volume in it is processed."
+        )
+        inRow = qt.QHBoxLayout()
+        inRow.addWidget(self.batchInputFolderLineEdit, 1)
+        inRow.addWidget(createButton("Browse...", callback=self.onBrowseBatchInputFolder, parent=widget))
+        inRowW = qt.QWidget(widget)
+        inRowW.setLayout(inRow)
+        form.addRow("Input folder", inRowW)
+
+        self.batchOutputFolderLineEdit = qt.QLineEdit(widget)
+        self.batchOutputFolderLineEdit.setToolTip(
+            "Output folder. Leave empty to use an 'AUAE_output' folder beside the inputs."
+        )
+        outRow = qt.QHBoxLayout()
+        outRow.addWidget(self.batchOutputFolderLineEdit, 1)
+        outRow.addWidget(createButton("Browse...", callback=self.onBrowseBatchOutputFolder, parent=widget))
+        outRowW = qt.QWidget(widget)
+        outRowW.setLayout(outRow)
+        form.addRow("Output folder", outRowW)
+
+        form.addRow(createButton(
+            "Run batch (folder)", callback=self.onRunBatchFolderClicked, parent=widget,
+            toolTip="Segment and export every volume in the input folder, using the current "
+                    "post-processing and export settings, into per-volume subfolders."
+        ))
+
+        # Advanced: a JSON template for explicit per-run control (ordered list, extension block).
         self.batchTemplateLineEdit = qt.QLineEdit(widget)
         self.batchTemplateLineEdit.text = str(BatchProcessorLib.defaultTemplatePath())
-        self.batchTemplateLineEdit.setToolTip("JSON template listing the volumes to process, in order.")
+        self.batchTemplateLineEdit.setToolTip("Advanced: JSON template listing the volumes and options.")
         browseRow = qt.QHBoxLayout()
         browseRow.addWidget(self.batchTemplateLineEdit, 1)
         browseRow.addWidget(createButton("Browse...", callback=self.onBrowseTemplate, parent=widget))
         browseRow.addWidget(createButton("Open folder", callback=self.onOpenTemplateFolder, parent=widget))
         rowWidget = qt.QWidget(widget)
         rowWidget.setLayout(browseRow)
-        form.addRow("Template JSON", rowWidget)
+        form.addRow("Template JSON (advanced)", rowWidget)
         form.addRow(createButton(
-            "Run batch", callback=self.onRunBatchClicked, parent=widget,
+            "Run batch (template)", callback=self.onRunBatchClicked, parent=widget,
             toolTip="Segment and export every volume listed in the template into per-volume subfolders."
         ))
         return widget
@@ -327,6 +402,10 @@ class SegmentationWidget(qt.QWidget):
         self.segmentEditorNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentEditorNode")
         if self.segmentEditorWidget is not None:
             self.segmentEditorWidget.setMRMLSegmentEditorNode(self.segmentEditorNode)
+            # Re-point the editor at whatever is currently selected (both may be None right
+            # after a scene close; the guards below then no-op).
+            self.segmentEditorWidget.setSegmentationNode(self.getCurrentSegmentationNode())
+            self._setEditorSourceVolume(self.getCurrentVolumeNode())
         self._initSlicerDisplay()
 
     @staticmethod
@@ -448,9 +527,11 @@ class SegmentationWidget(qt.QWidget):
             self._prevSegmentationNode.SetDisplayVisibility(False)
         segmentationNode = self.getCurrentSegmentationNode()
         self._prevSegmentationNode = segmentationNode
+        # Create the display node BEFORE handing the segmentation to the editor, otherwise the
+        # segments model logs "Invalid segmentation display node".
         self._initializeSegmentationNodeDisplay(segmentationNode)
         # Wire the embedded editor (refine step) to the current segmentation + source volume.
-        if self.segmentEditorWidget is not None:
+        if self.segmentEditorWidget is not None and self.segmentEditorNode is not None:
             self.segmentEditorWidget.setSegmentationNode(segmentationNode)
             self._setEditorSourceVolume(self.getCurrentVolumeNode())
 
@@ -509,6 +590,7 @@ class SegmentationWidget(qt.QWidget):
         options = AirwayExtension.defaultOptions()
         options["removeSmallIslands"] = bool(self.removeIslandsCheckBox.checked)
         options["keepLargestIsland"] = bool(self.keepLargestCheckBox.checked)
+        options["includeInternalAir"] = bool(self.internalAirCheckBox.checked)
         options["segmentExternalAir"] = bool(self.externalAirCheckBox.checked)
         options["mergeExternalAir"] = bool(self.mergeExternalAirCheckBox.checked)
         options["smoothingFactor"] = float(self.smoothingSlider.value)
@@ -517,7 +599,7 @@ class SegmentationWidget(qt.QWidget):
 
     def _collectExtensionOptions(self):
         return {
-            "direction": self.extendDirectionComboBox.currentText,
+            "direction": AirwayExtension.EXTENSION_DIRECTIONS[0],  # always inferior (neck)
             "lengthMm": float(self.extendLengthSpinBox.value),
             "smoothingFactor": float(self.smoothingSlider.value),
         }
@@ -600,11 +682,23 @@ class SegmentationWidget(qt.QWidget):
             self.objCheckBox: ExportFormat.OBJ,
             self.stlCheckBox: ExportFormat.STL,
             self.niftiCheckBox: ExportFormat.NIFTI,
+            self.nrrdCheckBox: ExportFormat.NRRD,
         }
         for checkBox, exportFormat in checkBoxes.items():
             if checkBox.isChecked():
                 selectedFormats |= exportFormat
         return selectedFormats
+
+    def getSelectedExportTargets(self):
+        """Which segments to write: any of 'airway', 'external', 'merged'."""
+        targets = []
+        if self.exportAirwayCheckBox.isChecked():
+            targets.append("airway")
+        if self.exportExternalAirCheckBox.isChecked():
+            targets.append("external")
+        if self.exportMergedCheckBox.isChecked():
+            targets.append("merged")
+        return targets
 
     def onExportClicked(self):
         segmentationNode = self.getCurrentSegmentationNode()
@@ -614,7 +708,11 @@ class SegmentationWidget(qt.QWidget):
 
         selectedFormats = self.getSelectedExportFormats()
         if selectedFormats == ExportFormat(0):
-            slicer.util.warningDisplay("Please select at least one export format before exporting.")
+            slicer.util.warningDisplay("Please select at least one export format (STL / OBJ / NIFTI / NRRD).")
+            return
+        targets = self.getSelectedExportTargets()
+        if not targets:
+            slicer.util.warningDisplay("Please select what to export (airway, external air, or merged).")
             return
 
         folderPath = qt.QFileDialog.getExistingDirectory(self, "Please select the export folder")
@@ -622,30 +720,53 @@ class SegmentationWidget(qt.QWidget):
             return
 
         with slicer.util.tryWithErrorDisplay("Export to " + folderPath + " failed.", waitCursor=True):
-            self.exportSegmentation(segmentationNode, folderPath, selectedFormats)
+            self.exportSegmentation(segmentationNode, folderPath, selectedFormats, targets)
             slicer.util.infoDisplay("Export successful to " + folderPath + ".")
 
     @staticmethod
-    def exportSegmentation(segmentationNode, folderPath, selectedFormats):
-        for closedSurfaceExport in [ExportFormat.STL, ExportFormat.OBJ]:
-            if selectedFormats & closedSurfaceExport:
-                slicer.vtkSlicerSegmentationsModuleLogic.ExportSegmentsClosedSurfaceRepresentationToFiles(
-                    folderPath,
-                    segmentationNode,
-                    None,
-                    closedSurfaceExport.name,
-                    True,
-                    1.0,
-                    False,
-                )
+    def exportSegmentation(segmentationNode, folderPath, selectedFormats, targets=("merged",)):
+        """Export the requested segments in the requested formats.
 
-        if selectedFormats & ExportFormat.NIFTI:
-            slicer.vtkSlicerSegmentationsModuleLogic.ExportSegmentsBinaryLabelmapRepresentationToFiles(
-                folderPath,
-                segmentationNode,
-                None,
-                "nii.gz",
-            )
+        targets is any of 'airway', 'external', 'merged'. 'airway'/'external' write only that
+        segment; 'merged' writes all segments together in a single file. STL/OBJ are surface
+        meshes; NIFTI/NRRD are labelmaps. Missing segments are skipped silently.
+        """
+        segmentation = segmentationNode.GetSegmentation()
+
+        def segmentIdByName(name):
+            for i in range(segmentation.GetNumberOfSegments()):
+                sid = segmentation.GetNthSegmentID(i)
+                if segmentation.GetSegment(sid).GetName() == name:
+                    return sid
+            return None
+
+        # Build the export jobs: (vtkStringArray of segment ids or None, merge flag).
+        jobs = []
+        if "airway" in targets:
+            sid = segmentIdByName(AirwayExtension.AIRWAY_SEGMENT_NAME)
+            if sid:
+                jobs.append((_stringArray([sid]), False))
+        if "external" in targets:
+            sid = segmentIdByName(AirwayExtension.EXTERNAL_AIR_SEGMENT_NAME)
+            if sid:
+                jobs.append((_stringArray([sid]), False))
+        if "merged" in targets:
+            jobs.append((None, True))
+
+        logic = slicer.vtkSlicerSegmentationsModuleLogic
+        for segmentIds, merge in jobs:
+            for surfaceFormat in (ExportFormat.STL, ExportFormat.OBJ):
+                if selectedFormats & surfaceFormat:
+                    # signature: (folder, node, segmentIds, fileFormat, lps=True, sizeScale=1.0, merge)
+                    # merge=True writes one combined mesh (STL only); keep LPS on as before.
+                    logic.ExportSegmentsClosedSurfaceRepresentationToFiles(
+                        folderPath, segmentationNode, segmentIds, surfaceFormat.name, True, 1.0, merge,
+                    )
+            for labelExt, labelFormat in (("nii.gz", ExportFormat.NIFTI), ("nrrd", ExportFormat.NRRD)):
+                if selectedFormats & labelFormat:
+                    logic.ExportSegmentsBinaryLabelmapRepresentationToFiles(
+                        folderPath, segmentationNode, segmentIds, labelExt,
+                    )
 
     # ------------------------------------------------------------------ post-processing
     def _onRemoveIslandsToggled(self, checked):
@@ -703,28 +824,59 @@ class SegmentationWidget(qt.QWidget):
         folder = os.path.dirname(self.batchTemplateLineEdit.text) or str(BatchProcessorLib.defaultTemplatePath().parent)
         qt.QDesktopServices.openUrl(qt.QUrl.fromLocalFile(folder))
 
+    def onBrowseBatchInputFolder(self):
+        folder = qt.QFileDialog.getExistingDirectory(self, "Select the input folder of volumes")
+        if folder:
+            self.batchInputFolderLineEdit.text = folder
+
+    def onBrowseBatchOutputFolder(self):
+        folder = qt.QFileDialog.getExistingDirectory(self, "Select the batch output folder")
+        if folder:
+            self.batchOutputFolderLineEdit.text = folder
+
+    def onRunBatchFolderClicked(self):
+        """Classic folder-in / folder-out run, using the current UI post-processing settings."""
+        inputFolder = self.batchInputFolderLineEdit.text.strip()
+        if not os.path.isdir(inputFolder):
+            slicer.util.warningDisplay("Select a valid input folder of volumes.")
+            return
+        exportFormats = self.getSelectedExportFormats()
+        if not exportFormats:
+            slicer.util.warningDisplay("Select at least one export format (STL / OBJ / NIFTI).")
+            return
+        config = BatchProcessorLib.folderConfig(
+            inputFolder, self.batchOutputFolderLineEdit.text.strip(),
+            self._exportFormatNames(exportFormats), self._collectPostprocessOptions(),
+            self.getSelectedExportTargets() or ["airway", "external"],
+        )
+        if not config["volumes"]:
+            slicer.util.warningDisplay("No volumes found in the input folder.")
+            return
+        self._runBatch(config, exportFormats)
+
     def onRunBatchClicked(self):
+        """Advanced run driven by a JSON template."""
         templatePath = self.batchTemplateLineEdit.text.strip()
         if not os.path.isfile(templatePath):
             slicer.util.warningDisplay("Batch template not found: " + templatePath)
             return
-
         try:
             config = BatchProcessorLib.loadConfig(templatePath)
         except Exception as exc:  # noqa: BLE001
             slicer.util.errorDisplay("Could not read batch template:\n" + str(exc))
             return
-
         if not config["volumes"]:
             slicer.util.warningDisplay("The batch template lists no volumes.")
             return
-
         if not config["output_root"]:
             folder = qt.QFileDialog.getExistingDirectory(self, "Select the batch output folder")
             if not folder:
                 return
             config["output_root"] = folder
+        self._runBatch(config, self._exportFormatFromNames(config["export_formats"]))
 
+    def _runBatch(self, config, exportFormats):
+        """Shared batch driver for both folder-in/folder-out and template runs."""
         self.currentInfoTextEdit.clear()
         self._setApplyVisible(False)
         try:
@@ -732,8 +884,6 @@ class SegmentationWidget(qt.QWidget):
                 return
             if not self._dependencyChecker.downloadWeightsIfNeeded(self.onProgressInfo):
                 return
-
-            exportFormats = self._exportFormatFromNames(config["export_formats"])
             deviceKwargs = Dependencies.parameterDeviceKwargs(self.deviceComboBox.currentText)
             processor = BatchProcessorLib.BatchProcessor(
                 self.nnUnetFolder(), self.exportSegmentation, self.onProgressInfo
@@ -755,13 +905,24 @@ class SegmentationWidget(qt.QWidget):
 
     @staticmethod
     def _exportFormatFromNames(names):
-        mapping = {"STL": ExportFormat.STL, "OBJ": ExportFormat.OBJ, "NIFTI": ExportFormat.NIFTI}
+        mapping = {"STL": ExportFormat.STL, "OBJ": ExportFormat.OBJ,
+                   "NIFTI": ExportFormat.NIFTI, "NRRD": ExportFormat.NRRD}
         selected = ExportFormat(0)
         for name in names:
             fmt = mapping.get(str(name).strip().upper())
             if fmt:
                 selected |= fmt
         return selected if selected != ExportFormat(0) else (ExportFormat.STL | ExportFormat.NIFTI)
+
+    @staticmethod
+    def _exportFormatNames(exportFormats):
+        """Flag -> list of format names (for the batch config's informational export list)."""
+        names = []
+        for name, fmt in (("STL", ExportFormat.STL), ("OBJ", ExportFormat.OBJ),
+                          ("NIFTI", ExportFormat.NIFTI), ("NRRD", ExportFormat.NRRD)):
+            if exportFormats & fmt:
+                names.append(name)
+        return names
 
     # ------------------------------------------------------------------ nnU-Net glue --
     @staticmethod

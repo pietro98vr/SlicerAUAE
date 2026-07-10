@@ -17,30 +17,83 @@ import slicer
 from . import AirwayExtension
 
 
+# Volume file types accepted in a folder-in / folder-out batch (the classic nnU-Net style).
+VOLUME_EXTENSIONS = (".nii.gz", ".nii", ".nrrd", ".nhdr", ".mha", ".mhd")
+
+
 def defaultTemplatePath():
     """Path to the embedded batch template shipped in Resources."""
     return Path(__file__).parent.joinpath("..", "Resources", "batch_template.json").resolve()
 
 
+def listVolumesInFolder(folder):
+    """Return the sorted volume files directly inside a folder (folder-in/folder-out batch)."""
+    folder = str(folder)
+    if not os.path.isdir(folder):
+        return []
+    found = []
+    for name in sorted(os.listdir(folder)):
+        low = name.lower()
+        if os.path.isfile(os.path.join(folder, name)) and any(low.endswith(e) for e in VOLUME_EXTENSIONS):
+            found.append(os.path.join(folder, name))
+    return found
+
+
+def folderConfig(inputFolder, outputRoot, exportFormats, postprocess=None, exportTargets=None):
+    """Build a batch config from an input folder (classic nnU-Net-style folder-in/folder-out).
+
+    Every volume in the folder is segmented with the given post-processing and written to a
+    per-volume subfolder under outputRoot. If outputRoot is empty it defaults to an
+    'AUAE_output' folder beside the inputs. postprocess uses the same option keys as
+    AirwayExtension.defaultOptions (so the widget can pass its current settings straight in).
+    exportTargets is any of 'airway', 'external', 'merged'.
+    """
+    inputFolder = str(inputFolder)
+    outputRoot = str(outputRoot or "").strip() or os.path.join(inputFolder, "AUAE_output")
+    return {
+        "mode": "segment",
+        "output_root": outputRoot,
+        "subfolder_from": "filename",
+        "export_formats": [str(f).strip().upper() for f in (exportFormats or ["STL", "NIFTI"])],
+        "export_targets": [str(t).strip().lower() for t in (exportTargets or ["airway", "external"])],
+        "postprocess": {**AirwayExtension.defaultOptions(), **(postprocess or {})},
+        "volumes": listVolumesInFolder(inputFolder),
+    }
+
+
 def loadConfig(jsonPath):
-    """Load and normalise a batch template file into a plain options dict."""
+    """Load and normalise a batch template file into a plain options dict.
+
+    'volumes' may be given explicitly; alternatively 'input_folder' points at a directory and
+    every volume inside it is used (classic folder-in/folder-out), and 'output_root' then
+    defaults to an 'AUAE_output' folder beside the inputs.
+    """
     with open(jsonPath, "r", encoding="utf-8") as handle:
         raw = json.load(handle)
 
     volumes = [str(v).strip() for v in raw.get("volumes", []) if str(v).strip()]
+    inputFolder = str(raw.get("input_folder", "") or "").strip()
+    if inputFolder and not volumes:
+        volumes = listVolumesInFolder(inputFolder)
+    outputRoot = str(raw.get("output_root", "") or "").strip()
+    if not outputRoot and inputFolder:
+        outputRoot = os.path.join(inputFolder, "AUAE_output")
     extension = raw.get("extension", {}) or {}
     # Island options are mutually exclusive, mirroring the UI: keep-largest wins if both set.
     keepLargest = bool(raw.get("keep_largest_island", False))
     removeSmall = bool(raw.get("remove_small_islands", True)) and not keepLargest
     return {
         "mode": str(raw.get("mode", "segment") or "segment").strip().lower(),
-        "output_root": str(raw.get("output_root", "") or "").strip(),
+        "output_root": outputRoot,
         "subfolder_from": str(raw.get("subfolder_from", "filename") or "filename"),
         "export_formats": [str(f).strip().upper() for f in raw.get("export_formats", ["STL", "NIFTI"])],
+        "export_targets": [str(t).strip().lower() for t in raw.get("export_targets", ["airway", "external"])],
         "postprocess": {
             "removeSmallIslands": removeSmall,
             "keepLargestIsland": keepLargest,
             "minIslandMm3": float(raw.get("min_island_mm3", AirwayExtension.DEFAULT_MIN_ISLAND_MM3)),
+            "includeInternalAir": bool(raw.get("include_internal_air", False)),
+            "minInternalAirMm3": float(raw.get("min_internal_air_mm3", AirwayExtension.DEFAULT_MIN_INTERNAL_AIR_MM3)),
             "segmentExternalAir": bool(raw.get("segment_external_air", False)),
             "mergeExternalAir": bool(raw.get("merge_external_air", False)),
             "smoothingFactor": float(raw.get("smoothing_factor", 0.0)),
@@ -131,7 +184,7 @@ class BatchProcessor:
 
                 subfolder = os.path.join(outputRoot, self._subfolderName(volumePath))
                 os.makedirs(subfolder, exist_ok=True)
-                self._exportFn(segmentationNode, subfolder, exportFormatEnum)
+                self._exportFn(segmentationNode, subfolder, exportFormatEnum, config.get("export_targets") or ["merged"])
 
                 entry["status"] = "ok"
                 entry["output"] = subfolder
@@ -198,7 +251,7 @@ class BatchProcessor:
                 )
                 subfolder = os.path.join(outputRoot, self._subfolderName(path))
                 os.makedirs(subfolder, exist_ok=True)
-                self._exportFn(extendedNode, subfolder, exportFormatEnum)
+                self._exportFn(extendedNode, subfolder, exportFormatEnum, config.get("export_targets") or ["merged"])
 
                 entry["status"] = "ok"
                 entry["output"] = subfolder

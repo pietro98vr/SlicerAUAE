@@ -3,8 +3,11 @@
 This module is the distinctive part of this project, which is based on SlicerUpperAirwaySegmentator:
 the geometric logic that extends the final binary airway mask beyond the acquired
 field of view; the automatic connected-component cleanup applied during the segmentation
-step (the embedded Segment Editor stays available for manual refinement); and the optional
-external face-air segment used as an inlet volume for flow modelling.
+step (the embedded Segment Editor stays available for manual refinement); the optional
+recovery of the internal air cavities (paranasal sinuses) the model drops, folded back into
+the airway; and the optional external face-air segment used as an inlet volume for flow
+modelling. Internal cavities and external air are separated by one head-envelope decomposition,
+so the sinuses never leak into the external-air segment.
 
 The functions here are deliberately kept free of any Qt/UI dependency so they can be
 unit-tested in a headless Slicer session. They operate on NumPy arrays in Slicer's
@@ -29,10 +32,10 @@ AXIS = 0
 # IJK->RAS origin shift. 0(K)->2, 1(J)->1, 2(I)->0 is exactly the KJI<->IJK reversal.
 NUMPY_AXIS_TO_IJK_AXIS = {0: 2, 1: 1, 2: 0}
 
-# UI-facing labels for the extension direction. Kept here so widget and logic agree.
+# Extension is always inferior (towards the neck); only the length is user-configurable. The
+# tuple is kept (single entry) so the logic that resolves the stack end stays unchanged.
 EXTENSION_DIRECTIONS = (
     "Inferior (neck)",
-    "Superior (cranial)",
 )
 
 # Single-label display, matching the upstream "Airway" segment appearance.
@@ -49,6 +52,11 @@ EXTERNAL_AIR_SEGMENT_COLOR = (255 / 255.0, 214 / 255.0, 102 / 255.0)  # warm yel
 # Ignore ambient-air blobs smaller than this (mm^3): keeps the meaningful front-of-face volume,
 # drops trapped-air specks between skin folds, headrest gaps, etc.
 DEFAULT_MIN_EXTERNAL_AIR_MM3 = 1000.0
+# Internal air cavities the model often drops (paranasal sinuses, sinonasal complex). These are
+# air ENCLOSED by the head envelope, so they belong to the airway, never to the external air.
+# The threshold doubles as a small-island filter that drops the smaller cephalostat / head-holder
+# air bubbles sitting near the frontal sinus, before those cavities are merged into the airway.
+DEFAULT_MIN_INTERNAL_AIR_MM3 = 250.0
 
 
 def defaultOptions():
@@ -57,6 +65,8 @@ def defaultOptions():
         "removeSmallIslands": True,
         "minIslandMm3": DEFAULT_MIN_ISLAND_MM3,
         "keepLargestIsland": False,
+        "includeInternalAir": True,  # attempt frontal-sinus recovery by default
+        "minInternalAirMm3": DEFAULT_MIN_INTERNAL_AIR_MM3,
         "smoothingFactor": 0.0,
         "segmentExternalAir": False,
         "mergeExternalAir": False,
@@ -101,30 +111,63 @@ def postprocessSegmentation(segmentationNode, volumeNode, options, log=None):
             voxelVolumeMm3 = float(np.prod(labelmapNode.GetSpacing()))
             array = removeSmallIslands(array, options.get("minIslandMm3", DEFAULT_MIN_ISLAND_MM3), voxelVolumeMm3, log)
 
-        # Optional second segment: ambient air in front of the face (flow-modelling inlet).
-        # Computed on the labelmap grid (same as the cleaned airway) so the two masks align.
+        # Air handling on the labelmap grid (same as the cleaned airway, so the masks align).
+        # Both features share one decomposition of the volume into a sealed head envelope:
+        # air INSIDE the envelope = internal cavities (sinuses) that belong to the airway;
+        # air OUTSIDE = ambient air. This is what keeps the frontal sinuses out of the
+        # external-air segment and lets us fold them back into the airway.
         externalArray = None
         baseIJKToRAS = volumeIJKToRASArray(labelmapNode)
-        if options.get("segmentExternalAir", False):
+        wantExternal = options.get("segmentExternalAir", False)
+        wantInternal = options.get("includeInternalAir", False)
+        if wantExternal or wantInternal:
             voxelVolumeMm3 = float(np.prod(labelmapNode.GetSpacing()))
-            externalArray = computeExternalAirMask(
-                _volumeArrayLike(volumeNode, array), array, baseIJKToRAS, voxelVolumeMm3, log
+            volumeArray = _volumeArrayLike(volumeNode, array)
+            threshold = _airThresholdFromAirway(volumeArray, array) if volumeArray is not None else None
+            if threshold is None:
+                _log(log, "Air handling skipped: grey-level volume not available on the airway grid.")
+            else:
+                sealedHead = _sealedHeadMask(volumeArray, threshold, labelmapNode.GetSpacing(), log)
+                airMask = volumeArray <= threshold
+                # Recover the internal air cavities (sinuses) the model drops, back INTO the airway.
+                # Any island cleanup above (keep-largest / remove-small) has already been applied to
+                # the main airway; the sinuses are cleaned separately here, dropping the smaller
+                # cephalostat air bubbles by size before they are merged in.
+                if wantInternal and sealedHead is not None:
+                    internal = computeInternalAirCavities(
+                        airMask, sealedHead, array, voxelVolumeMm3, log,
+                        minRegionMm3=float(options.get("minInternalAirMm3", DEFAULT_MIN_INTERNAL_AIR_MM3)),
+                    )
+                    if internal is not None and int(internal.sum()) > 0:
+                        array = ((array > 0) | (internal > 0)).astype(np.uint8)
+                # External air = ambient air OUTSIDE the head envelope, in front of the face.
+                if wantExternal and sealedHead is not None:
+                    externalArray = computeExternalAirMask(
+                        airMask, array, sealedHead, baseIJKToRAS, voxelVolumeMm3, log
+                    )
+                    if externalArray is not None and int(externalArray.sum()) == 0:
+                        externalArray = None
+
+        # Extension is applied to the AIRWAY only, then (if requested) the external air is merged
+        # in AFTER extension, padded onto the extended grid. This guarantees the caudal extension
+        # replicates the airway's terminal slice, never the external air (which can sit lower).
+        mergeExternal = bool(options.get("mergeExternalAir", False)) and externalArray is not None
+        if options.get("extend", False) and float(options.get("lengthMm", 0.0)) > 0:
+            array, ijkToRAS, padInfo = extendBinaryArray(
+                array, labelmapNode, float(options["lengthMm"]),
+                options.get("direction", EXTENSION_DIRECTIONS[0]), log
             )
-            if externalArray is not None and int(externalArray.sum()) == 0:
+            if mergeExternal:
+                externalOnGrid = _padCompanionToExtendedGrid(externalArray, padInfo)
+                array = ((array > 0) | (externalOnGrid > 0)).astype(np.uint8)
                 externalArray = None
-            # 'Merge into a single segmentation': union external air into the airway mask BEFORE
-            # extension, so the whole fluid domain is one segment on one grid.
-            if externalArray is not None and options.get("mergeExternalAir", False):
+                _log(log, "External air merged into the airway segment (after extension).")
+        else:
+            ijkToRAS = baseIJKToRAS
+            if mergeExternal:
                 array = ((array > 0) | (externalArray > 0)).astype(np.uint8)
                 externalArray = None
                 _log(log, "External air merged into the airway segment.")
-
-        if options.get("extend", False) and float(options.get("lengthMm", 0.0)) > 0:
-            array, ijkToRAS = extendBinaryArray(
-                array, labelmapNode, float(options["lengthMm"]), options.get("direction", EXTENSION_DIRECTIONS[0]), log
-            )
-        else:
-            ijkToRAS = baseIJKToRAS
 
         node = _buildAirwaySegmentation(array, ijkToRAS, segmentationNode.GetName(), log)
         if externalArray is not None:
@@ -165,7 +208,7 @@ def extendSegmentation(segmentationNode, volumeNode, options, log=None):
         if int(array.sum()) == 0:
             raise RuntimeError("Segmentation is empty; nothing to extend.")
 
-        array, ijkToRAS = extendBinaryArray(
+        array, ijkToRAS, _padInfo = extendBinaryArray(
             array, labelmapNode, lengthMm, options.get("direction", EXTENSION_DIRECTIONS[0]), log
         )
         node = _buildAirwaySegmentation(array, ijkToRAS, segmentationNode.GetName(), log)
@@ -363,18 +406,90 @@ def _rasComponentField(shape, ijkToRAS, rasRow):
     return row[3] + kRamp[:, None, None] + jRamp[None, :, None] + iRamp[None, None, :]
 
 
-def computeExternalAirMask(volumeArray, airwayArray, ijkToRAS, voxelVolumeMm3, log=None,
-                           minRegionMm3=DEFAULT_MIN_EXTERNAL_AIR_MM3):
-    """Segment the ambient air in front of the face as a binary mask on the airway grid.
+def _airThresholdFromAirway(volumeArray, airwayArray):
+    """Self-calibrated air/tissue threshold from the intensities under the known airway mask.
 
-    The air threshold is self-calibrated from the intensities under the known airway mask, so
-    it holds whether the volume is in Hounsfield units (air ~ -1000) or intensity-shifted
-    (air ~ 0). Ambient air is taken as the air components touching the volume border, clipped
-    to the region anterior to the airway (the 'front of the face'), with the airway itself and
-    negligible specks removed. Returns a uint8 array; an all-zero array means 'not found'.
+    The airway lumen is air, so its intensity distribution fixes the air threshold. This holds
+    whether the volume is in Hounsfield units (air ~ -1000) or intensity-shifted (air ~ 0), so
+    no fixed HU value is assumed. Returns None when the airway mask is empty.
     """
     if volumeArray is None:
-        _log(log, "External air skipped: grey-level volume not available on the airway grid.")
+        return None
+    vals = volumeArray[airwayArray > 0]
+    if vals.size == 0:
+        return None
+    return float(vals.mean() + 2.0 * (vals.std() + 1e-6))
+
+
+def _sealedHeadMask(volumeArray, threshold, spacingIJK, log=None):
+    """Solid head envelope: the tissue mask closed to seal small openings, then hole-filled.
+
+    Everything brighter than the air threshold is tissue or bone; the largest such component is
+    the patient. Morphological closing seals the narrow openings (nostrils, mouth, thin sinus
+    ducts) so that hole-filling then treats the whole internal airspace as enclosed. The result
+    is a solid mask whose interior holds the sinuses and airway and whose exterior is ambient
+    air. Returns a boolean array, or None if scipy is unavailable.
+    """
+    try:
+        from scipy import ndimage
+    except Exception as exc:  # noqa: BLE001
+        _log(log, "Air envelope skipped; scipy unavailable: " + str(exc))
+        return None
+    tissue = volumeArray > threshold
+    labeled, count = ndimage.label(tissue)
+    if count > 1:
+        sizes = np.bincount(labeled.ravel())
+        sizes[0] = 0
+        tissue = labeled == int(np.argmax(sizes))  # the patient, not the table or props
+    # Seal openings up to ~3 mm before filling; iterations scale with the finest voxel spacing.
+    minSpacing = min([float(s) for s in spacingIJK if float(s) > 0] or [1.0])
+    iterations = max(1, min(8, int(round(3.0 / minSpacing))))
+    sealed = ndimage.binary_closing(tissue, iterations=iterations)
+    sealed = ndimage.binary_fill_holes(sealed)
+    return sealed
+
+
+def computeInternalAirCavities(airMask, sealedHead, airwayArray, voxelVolumeMm3, log=None,
+                               minRegionMm3=DEFAULT_MIN_INTERNAL_AIR_MM3):
+    """Air enclosed by the head envelope and not already in the airway: the dropped sinuses.
+
+    These paranasal / sinonasal cavities belong to the airway, so the caller unions them into
+    it. Components below minRegionMm3 are dropped, which removes the smaller cephalostat /
+    head-holder air bubbles near the frontal sinus before the merge. Returns a uint8 array; an
+    all-zero array means 'nothing to add'.
+    """
+    if sealedHead is None:
+        return np.zeros_like(airwayArray, dtype=np.uint8)
+    try:
+        from scipy import ndimage
+    except Exception as exc:  # noqa: BLE001
+        _log(log, "Internal air skipped; scipy unavailable: " + str(exc))
+        return np.zeros_like(airwayArray, dtype=np.uint8)
+    internal = (airMask & sealedHead)
+    internal[airwayArray > 0] = False
+    minVox = int(np.ceil(float(minRegionMm3) / max(float(voxelVolumeMm3), 1e-6)))
+    if minVox > 1:
+        labeled, count = ndimage.label(internal)
+        if count > 0:
+            sizes = np.bincount(labeled.ravel())
+            sizes[0] = 0
+            keep = np.where(sizes >= minVox)[0]
+            internal = np.isin(labeled, keep)
+    result = internal.astype(np.uint8)
+    _log(log, "Internal air cavities (sinuses) recovered for the airway: %d voxels." % int(result.sum()))
+    return result
+
+
+def computeExternalAirMask(airMask, airwayArray, sealedHead, ijkToRAS, voxelVolumeMm3, log=None,
+                           minRegionMm3=DEFAULT_MIN_EXTERNAL_AIR_MM3):
+    """Ambient air OUTSIDE the head envelope, in front of the face, as a binary mask.
+
+    External air is the air outside the sealed head, so internal cavities such as the frontal
+    sinuses are excluded by construction. It is restricted to the components touching the volume
+    border and to the region anterior to the airway (the 'front of the face'), with the airway
+    and negligible specks removed. Returns a uint8 array; an all-zero array means 'not found'.
+    """
+    if sealedHead is None:
         return np.zeros_like(airwayArray, dtype=np.uint8)
     try:
         from scipy import ndimage
@@ -382,14 +497,10 @@ def computeExternalAirMask(volumeArray, airwayArray, ijkToRAS, voxelVolumeMm3, l
         _log(log, "External air skipped; scipy unavailable: " + str(exc))
         return np.zeros_like(airwayArray, dtype=np.uint8)
 
-    airwayVals = volumeArray[airwayArray > 0]
-    if airwayVals.size == 0:
-        return np.zeros_like(airwayArray, dtype=np.uint8)
-    # Upper bound of the airway (air) intensity distribution -> everything this dark is air-like.
-    threshold = float(airwayVals.mean() + 2.0 * (airwayVals.std() + 1e-6))
-    airMask = volumeArray <= threshold
+    external = (airMask & ~sealedHead)  # air strictly outside the head envelope
+    external[airwayArray > 0] = False
 
-    labeled, count = ndimage.label(airMask)
+    labeled, count = ndimage.label(external)
     if count == 0:
         return np.zeros_like(airwayArray, dtype=np.uint8)
     borderLabels = set()
@@ -398,15 +509,14 @@ def computeExternalAirMask(volumeArray, airwayArray, ijkToRAS, voxelVolumeMm3, l
     borderLabels.discard(0)
     if not borderLabels:
         return np.zeros_like(airwayArray, dtype=np.uint8)
-    external = np.isin(labeled, list(borderLabels))
-    external[airwayArray > 0] = False  # never double-count the airway lumen
+    external = np.isin(labeled, list(borderLabels))  # the ambient air around the patient
 
     # Clip to the front of the face: keep voxels anterior to the airway's mid A-coordinate.
     try:
-        aField = _rasComponentField(volumeArray.shape, ijkToRAS, 1)  # RAS 'A' (anterior +)
+        aField = _rasComponentField(airwayArray.shape, ijkToRAS, 1)  # RAS 'A' (anterior +)
         airwayA = aField[airwayArray > 0]
         if airwayA.size:
-            external &= aField >= float(np.median(airwayA))
+            external = external & (aField >= float(np.median(airwayA)))
     except Exception as exc:  # noqa: BLE001
         _log(log, "External air: anterior clip skipped (%s); keeping full ambient air." % exc)
 
@@ -419,7 +529,7 @@ def computeExternalAirMask(volumeArray, airwayArray, ijkToRAS, voxelVolumeMm3, l
             keep = np.where(sizes >= minVox)[0]
             external = np.isin(lab2, keep)
     result = external.astype(np.uint8)
-    _log(log, "External face air: %d voxels (air threshold <= %.1f)." % (int(result.sum()), threshold))
+    _log(log, "External face air: %d voxels." % int(result.sum()))
     return result
 
 
@@ -473,7 +583,9 @@ def extendBinaryArray(array, referenceNode, extensionMm, direction, log=None):
     matrix is shifted when the array grows on the 'min' side so the extended mask stays
     connected and correctly positioned in space.
 
-    Returns (extendedArray, ijkToRAS).
+    Returns (extendedArray, ijkToRAS, padInfo) where padInfo = (side, slicesAddedOutside).
+    padInfo lets a companion mask (e.g. the external air) be padded onto the same extended grid
+    with _padCompanionToExtendedGrid, so it can be unioned in AFTER the extension.
     """
     nonEmpty = np.where(np.any(array > 0, axis=tuple(i for i in range(3) if i != AXIS)))[0]
     if len(nonEmpty) == 0:
@@ -484,7 +596,7 @@ def extendBinaryArray(array, referenceNode, extensionMm, direction, log=None):
     stepMm = float(arraySpacing[AXIS])
     slicesToAdd = int(round(float(extensionMm) / stepMm)) if stepMm > 0 else 0
     if slicesToAdd <= 0:
-        return array.astype(np.uint8), volumeIJKToRASArray(referenceNode)
+        return array.astype(np.uint8), volumeIJKToRASArray(referenceNode), (None, 0)
 
     ijkToRAS = volumeIJKToRASArray(referenceNode)
     extendSide = resolveExtensionSideForDirection(direction, array.shape, ijkToRAS)
@@ -505,7 +617,7 @@ def extendBinaryArray(array, referenceNode, extensionMm, direction, log=None):
     # Step 2: if the request exceeds the in-FOV gap, grow the array beyond the border.
     slicesToAddOutside = slicesToAdd - slicesToFillInside
     if slicesToAddOutside <= 0:
-        return filled.astype(np.uint8), volumeIJKToRASArray(referenceNode)
+        return filled.astype(np.uint8), volumeIJKToRASArray(referenceNode), (extendSide, 0)
 
     oldShape = list(filled.shape)
     newShape = oldShape.copy()
@@ -528,7 +640,22 @@ def extendBinaryArray(array, referenceNode, extensionMm, direction, log=None):
 
     if log:
         _log(log, "Extension: %d slice(s) added beyond the volume (side=%s)." % (slicesToAddOutside, extendSide))
-    return extended.astype(np.uint8), ijkToRAS
+    return extended.astype(np.uint8), ijkToRAS, (extendSide, slicesToAddOutside)
+
+
+def _padCompanionToExtendedGrid(companion, padInfo):
+    """Pad a companion mask with zeros so it matches an array extended by extendBinaryArray.
+
+    The extension only ever adds 'slicesAddedOutside' slices on one end of AXIS; padding the
+    companion (e.g. the external air) the same way puts it back on the extended grid without
+    moving it, so it can be unioned after the airway has been extended.
+    """
+    side, nOutside = padInfo
+    if not nOutside:
+        return companion
+    padWidth = [(0, 0)] * companion.ndim
+    padWidth[AXIS] = (nOutside, 0) if side == "min" else (0, nOutside)
+    return np.pad(companion, padWidth, mode="constant")
 
 
 def _log(log, message):
