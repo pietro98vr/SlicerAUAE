@@ -336,7 +336,8 @@ class SegmentationWidget(qt.QWidget):
         self.batchInputFolderLineEdit = qt.QLineEdit(folderBox)
         self.batchInputFolderLineEdit.setToolTip(
             "Folder of inputs: single-file volumes (.nii/.nii.gz/.nrrd/.mha...) and/or DICOM "
-            "series (per-patient subfolders). Every input in it is processed."
+            "series (one series per patient subfolder, files may be nested). Every input is "
+            "processed; a folder with more than one series fails with an error."
         )
         inRow = qt.QHBoxLayout()
         inRow.addWidget(self.batchInputFolderLineEdit, 1)

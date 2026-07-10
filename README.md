@@ -273,10 +273,17 @@ with two paths.
 
 ### Folder in, folder out (the classic way)
 
-Point **Input folder** at a folder of volumes and press **Run batch (folder)**. Every volume in it
-(`.nii`, `.nii.gz`, `.nrrd`, `.nhdr`, `.mha`, `.mhd`) is processed with the current Post-processing
-and Export settings, and each result goes to its own subfolder. **Output folder** is optional; when
-empty, results land in an `AUAE_output` folder beside the inputs.
+Point **Input folder** at a folder of inputs and press **Run batch (folder)**. Each input is
+processed with the current Post-processing and Export settings, and each result goes to its own
+subfolder. **Output folder** is optional; when empty, results land in an `AUAE_output` folder
+beside the inputs.
+
+An input is either a single-file volume (`.nii`, `.nii.gz`, `.nrrd`, `.nhdr`, `.mha`, `.mhd`) or a
+DICOM series. For DICOM, put one series per patient in its own subfolder of the input folder; the
+files may sit directly in that subfolder or nested deeper (`Patient/Study/Series/*.dcm`), since
+detection and import both recurse. One series per patient folder is required: if a folder holds
+more than one series, that case fails with a clear error rather than segmenting the wrong series,
+so you split it and re-run. A folder that is itself a single series is treated as one case.
 
 ### Template (advanced)
 

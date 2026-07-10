@@ -2,7 +2,7 @@
   "_about": "Batch template for AUAE. Either set 'input_folder' to a folder of volumes (classic folder-in/folder-out) or fill 'volumes' with explicit input paths. Each volume is segmented, post-processed, optionally extended, and written to its own subfolder under 'output_root'.",
   "_fields": {
     "mode": "'segment' (default) segments the CT/CBCT volumes; 'extend' extends existing airway segmentation files listed in 'volumes' (no model or GPU needed).",
-    "input_folder": "Optional. Folder of inputs: single-file volumes (.nii/.nii.gz/.nrrd/.nhdr/.mha/.mhd) and/or DICOM series (per-patient subfolders, or the folder itself when it is one series). When set and 'volumes' is empty, every input is processed and 'output_root' defaults to an 'AUAE_output' folder beside it.",
+    "input_folder": "Optional. Folder of inputs: single-file volumes (.nii/.nii.gz/.nrrd/.nhdr/.mha/.mhd) and/or DICOM series (one series per patient subfolder; files may be nested, e.g. Patient/Study/Series/*.dcm; a folder that is itself one series counts as one case). A folder holding more than one series fails with an error. When set and 'volumes' is empty, every input is processed and 'output_root' defaults to an 'AUAE_output' folder beside it.",
     "output_root": "Folder where a per-volume subfolder is created. Leave empty to be asked at run time (or to default beside input_folder).",
     "subfolder_from": "How each output subfolder is named: 'filename' = the input file stem.",
     "export_formats": "Any of STL, OBJ (surface meshes), NIFTI, NRRD (labelmaps).",

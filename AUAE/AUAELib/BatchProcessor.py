@@ -39,12 +39,16 @@ def _looksLikeDicom(path):
 
 
 def _isDicomFolder(folder):
-    """True if a folder directly holds at least one DICOM file (a DICOM series)."""
+    """True if a folder contains at least one DICOM file at any depth.
+
+    The search recurses, so an exported layout like Patient/Study/Series/*.dcm is detected, and
+    it stops at the first DICOM file found. One series per patient folder is assumed.
+    """
     try:
-        for name in os.listdir(folder):
-            p = os.path.join(folder, name)
-            if os.path.isfile(p) and _looksLikeDicom(p):
-                return True
+        for root, _dirs, files in os.walk(folder):
+            for name in files:
+                if _looksLikeDicom(os.path.join(root, name)):
+                    return True
     except Exception:  # noqa: BLE001
         pass
     return False
@@ -328,22 +332,28 @@ class BatchProcessor:
         return node
 
     def _loadDicomSeries(self, folder):
-        """Import and load a DICOM series folder, returning its scalar volume node."""
+        """Import and load a single DICOM series folder, returning its scalar volume node.
+
+        One series per patient folder is required. If the folder yields more than one series the
+        method raises, rather than guessing which one to segment; split the series into separate
+        folders. Detection and import both recurse, so nested Patient/Study/Series layouts work.
+        """
         from DICOMLib import DICOMUtils
         loadedIds = []
         with DICOMUtils.TemporaryDICOMDatabase() as db:
             DICOMUtils.importDicom(folder, db)
             for patientUID in db.patients():
                 loadedIds.extend(DICOMUtils.loadPatientByUID(patientUID))
-        volumes = []
-        for nodeId in loadedIds:
-            node = slicer.mrmlScene.GetNodeByID(nodeId)
-            if node is not None and node.IsA("vtkMRMLScalarVolumeNode"):
-                volumes.append(node)
+        volumes = [node for node in (slicer.mrmlScene.GetNodeByID(i) for i in loadedIds)
+                   if node is not None and node.IsA("vtkMRMLScalarVolumeNode")]
         if not volumes:
             raise RuntimeError("No volume found in DICOM folder: " + folder)
-        for extra in volumes[1:]:  # keep the first series, drop the rest to avoid clutter
-            slicer.mrmlScene.RemoveNode(extra)
+        if len(volumes) > 1:
+            for node in volumes:
+                slicer.mrmlScene.RemoveNode(node)
+            raise RuntimeError(
+                "Found %d DICOM series in '%s'; one series per patient folder is required. "
+                "Split the series into separate folders and re-run." % (len(volumes), folder))
         return volumes[0]
 
     @staticmethod
