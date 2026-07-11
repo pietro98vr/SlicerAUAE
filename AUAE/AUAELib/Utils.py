@@ -53,6 +53,7 @@ def set3DViewBackgroundColors(topColor, bottomColor):
 
 
 def setBoxAndTextVisibilityOnThreeDViews(isVisible):
+    """Show or hide the bounding box and axis labels on every 3D view."""
     import slicer
     layoutManager = slicer.app.layoutManager()
     for i in range(layoutManager.threeDViewCount):
@@ -62,6 +63,7 @@ def setBoxAndTextVisibilityOnThreeDViews(isVisible):
 
 
 def setConventionalWideScreenView():
+    """Switch Slicer to the conventional widescreen layout."""
     import slicer
     layoutManager = slicer.app.layoutManager()
     layoutManager.setLayout(slicer.vtkMRMLLayoutNode.SlicerLayoutConventionalWidescreenView)

@@ -22,13 +22,15 @@ class AUAE(ScriptedLoadableModule):
 
         self.parent.helpText = tr(
             "Fully automatic AI segmentation of the upper airway (nasal cavity, nasopharynx, "
-            "oropharynx) on CT/CBCT, based on the UpperAirwaySegmentator nnU-Net model.\n\n"
-            "Based on capenaka/SlicerUpperAirwaySegmentator. It keeps the upstream "
-            "segmentation core and multi-format export (STL/OBJ/NIFTI), removes the embedded "
-            "Segment Editor, and adds: (1) airway extension for flow modelling, (2) batch "
-            "processing driven by a JSON template with per-volume output subfolders, "
-            "(3) mutually-exclusive island cleanup (remove-small vs keep-largest), and "
-            "(4) an autonomous, CUDA-aware dependency preflight."
+            "oropharynx) on CT and CBCT, based on the UpperAirwaySegmentator nnU-Net model.\n\n"
+            "Based on capenaka/SlicerUpperAirwaySegmentator. AUAE keeps the upstream "
+            "segmentation core and the multi-format export, and works in three steps: segment, "
+            "refine in an embedded Segment Editor, then extend. It cleans the mask (remove small "
+            "islands or keep the largest), recovers the sinuses the model drops, optionally "
+            "segments the external face air for flow modelling, and grows the airway inferiorly. "
+            "Export is STL, OBJ, NIFTI or NRRD, per segment or merged. Batch processing runs a "
+            "folder of volumes and DICOM series, or a JSON template, and an autonomous, "
+            "CUDA-aware preflight installs and checks the dependencies before a run."
         )
         self.parent.acknowledgementText = tr(
             "Developed by Dr. Pietro Montagna (DDS, MSc, PhD Student; pietro.montagna@univr.it) and "
