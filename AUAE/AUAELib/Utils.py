@@ -9,7 +9,6 @@ def createButton(name, callback=None, isCheckable=False, icon=None, toolTip="", 
     :param isCheckable: When True, button can be checked (click will send check state)
     :param icon: QIcon to use for button
     :param toolTip: Tooltip displayed when hovering button
-    :param qtProperty: Optional list of property name and property value to set to button
     :param parent: QWidget parent of this button
 
     :returns: QPushButton

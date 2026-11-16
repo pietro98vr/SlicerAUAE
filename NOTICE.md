@@ -5,8 +5,8 @@
 This project is based on **SlicerUpperAirwaySegmentator**
 (https://github.com/capenaka/SlicerUpperAirwaySegmentator), licensed under the
 **Apache License 2.0** (see `LICENSE.md`). The upstream extension and its nnU-Net model
-provide the automatic upper-airway segmentation core and the STL/OBJ/NIFTI export that this
-project keeps unchanged.
+provide the automatic upper-airway segmentation core and the mesh and labelmap export that
+this project builds on.
 
 Upstream authors: Alejandro Matos Camarillo, Silvia Capenakas, Manuel Lagravere
 (University of Alberta).
@@ -21,17 +21,22 @@ University of Verona, Verona, Italy.
 
 ## Modifications (contributed under Apache-2.0)
 
-- Airway-extension step for flow modelling: `AUAELib/AirwayExtension.py`.
-- Batch processing with a JSON template and per-volume output subfolders:
-  `AUAELib/BatchProcessor.py`, `Resources/batch_template.json`.
-- Mutually-exclusive island cleanup (remove-small vs keep-largest), reimplemented in NumPy/SciPy.
+- Post-processing in NumPy/SciPy (`AUAELib/AirwayExtension.py`): island cleanup (remove-small
+  or keep-largest), recovery of the paranasal sinuses, optional external face-air segment, and
+  an inferior airway extension for flow modelling.
+- Three-step panel (segment, refine in the embedded Segment Editor, extend) and export to
+  STL, OBJ, NIFTI or NRRD, per segment or merged: `AUAELib/SegmentationWidget.py`.
+- Batch processing of a folder (volumes and DICOM series) or a JSON template, with per-case
+  output subfolders: `AUAELib/BatchProcessor.py`, `Resources/batch_template.json`.
+- Headless command-line batch runner: `CLI/auae_batch.py`.
+- MCP server to run the extension from an assistant: `MCP/auae_mcp.py`.
 - Autonomous, CUDA-aware dependency preflight: `AUAELib/Dependencies.py`.
-- Removed the embedded Segment Editor.
+- Removed the unused upstream `Signal.py` helper.
 
 ## Citation
 
 Please cite the upstream paper (Gianoni-Capenakas et al., Journal of Dentistry 2026) and
-nnU-Net (Isensee et al., Nature Methods 2021). See `README.md` and `CITATION.cff`.
+nnU-Net (Isensee et al., Nature Methods 2021). See `README.md`.
 
 ## Third-party components
 

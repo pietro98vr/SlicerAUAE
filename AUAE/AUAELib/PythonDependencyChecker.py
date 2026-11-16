@@ -1,5 +1,4 @@
 import json
-import sys
 import zipfile
 from pathlib import Path
 
@@ -11,36 +10,33 @@ import slicer
 
 
 class PythonDependencyChecker:
-    """
-    Class responsible for installing the Modules dependencies
+    """Downloads the upstream model weights and keeps them up to date.
+
+    Package installation lives in the Dependencies module; this class only handles the weights
+    published in the upstream GitHub release.
     """
 
     def __init__(self, repoPath=None, destWeightFolder=None):
         from .SegmentationWidget import SegmentationWidget
-        self.dependencyChecked = False
         self.destWeightFolder = Path(destWeightFolder or SegmentationWidget.nnUnetFolder())
         self.repo_path = repoPath or "capenaka/SlicerUpperAirwaySegmentator"
-
-    @classmethod
-    def areDependenciesSatisfied(cls):
-        try:
-            import torch  # noqa: F401
-            import nnunetv2  # noqa: F401
-            return True
-        except ImportError:
-            return False
+        self._updateChecked = False  # ask the GitHub API for a newer release once per session
 
     def downloadWeightsIfNeeded(self, progressCallback):
         if self.areWeightsMissing():
             return self.downloadWeights(progressCallback)
 
-        elif self.areWeightsOutdated():
-            if qt.QMessageBox.question(
+        if not self._updateChecked:
+            self._updateChecked = True
+            if self.areWeightsOutdated():
+                answer = qt.QMessageBox.question(
                     None,
                     "New weights are available",
-                    "New weights are available. Would you like to download them?"
-            ):
-                return self.downloadWeights(progressCallback)
+                    "New weights are available. Would you like to download them?",
+                    qt.QMessageBox.Yes | qt.QMessageBox.No,
+                )
+                if answer == qt.QMessageBox.Yes:
+                    return self.downloadWeights(progressCallback)
         return True
 
     def areWeightsMissing(self):
@@ -54,17 +50,13 @@ class PythonDependencyChecker:
         return assets[0].browser_download_url
 
     def areWeightsOutdated(self):
+        """True when a newer release exists. Never raises: offline or rate-limited means 'no'."""
         if not self.getWeightDownloadInfoPath().exists():
             return True
-
-        from github import GithubException
         try:
             return self.getLastDownloadedWeights() != self.getLatestReleaseUrl()
-        except GithubException:
+        except Exception:  # noqa: BLE001 - no network, API rate limit, PyGithub missing...
             return False
-
-    def getDestWeightFolder(self):
-        return self.destWeightFolder
 
     def getDatasetPath(self):
         try:

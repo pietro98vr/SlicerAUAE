@@ -32,12 +32,6 @@ AXIS = 0
 # IJK->RAS origin shift. 0(K)->2, 1(J)->1, 2(I)->0 is exactly the KJI<->IJK reversal.
 NUMPY_AXIS_TO_IJK_AXIS = {0: 2, 1: 1, 2: 0}
 
-# Extension is always inferior (towards the neck); only the length is user-configurable. The
-# tuple is kept (single entry) so the logic that resolves the stack end stays unchanged.
-EXTENSION_DIRECTIONS = (
-    "Inferior (neck)",
-)
-
 # Single-label display, matching the upstream "Airway" segment appearance.
 AIRWAY_SEGMENT_NAME = "Airway"
 AIRWAY_SEGMENT_COLOR = (130 / 255.0, 177 / 255.0, 255 / 255.0)  # light blue
@@ -71,116 +65,93 @@ def defaultOptions():
         "segmentExternalAir": False,
         "mergeExternalAir": False,
         "extend": False,
-        "direction": EXTENSION_DIRECTIONS[0],
         "lengthMm": 100.0,
     }
 
 
 def postprocessSegmentation(segmentationNode, volumeNode, options, log=None):
-    """Apply island cleanup and optional airway extension to a segmentation node.
+    """Clean the raw model output and build the final airway segmentation node.
 
-    Single source of truth for both the interactive widget and the batch processor.
-    Because removing the embedded Segment Editor also removes upstream's island effect,
-    the cleanup here is done in NumPy on the exported binary labelmap. The optional
-    extension may grow the geometry, so the result is rebuilt as a fresh segmentation
-    node carrying a single "Airway" segment, then closed-surface converted for display
-    and export. Returns the new segmentation node.
+    Single source of truth for both the interactive widget and the batch processor. The steps
+    run in NumPy on the mask exported to the reference volume grid: island cleanup, optional
+    sinus recovery, optional external face air, optional inferior extension. The extension may
+    grow the geometry, so the result is rebuilt as a fresh segmentation node carrying an
+    "Airway" segment (plus "External air (face)" when requested and not merged). The closed
+    surface is generated once, at the end. Returns the new segmentation node.
     """
     options = {**defaultOptions(), **(options or {})}
 
-    # Export the airway mask to a labelmap using the reference (volume) geometry, so the
-    # full slice stack is available for the inferior/superior extension computation.
     labelmapNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLabelMapVolumeNode", "airway_tmp_labelmap")
     try:
-        if volumeNode is not None:
-            segmentationNode.SetReferenceImageGeometryParameterFromVolumeNode(volumeNode)
-        segLogic = slicer.modules.segmentations.logic()
-        exported = segLogic.ExportAllSegmentsToLabelmapNode(
-            segmentationNode, labelmapNode, slicer.vtkSegmentation.EXTENT_REFERENCE_GEOMETRY
-        )
-        if exported is False:
-            raise RuntimeError("Could not export segmentation to labelmap for post-processing.")
+        airway = _exportBinaryMask(segmentationNode, volumeNode, labelmapNode)
+        spacing = labelmapNode.GetSpacing()
+        voxelVolumeMm3 = float(np.prod(spacing))
+        baseIJKToRAS = volumeIJKToRASArray(labelmapNode)
 
-        array = (slicer.util.arrayFromVolume(labelmapNode) > 0).astype(np.uint8)
-        if int(array.sum()) == 0:
-            raise RuntimeError("Segmentation is empty; nothing to post-process.")
-
-        if options.get("keepLargestIsland", False):
-            array = keepLargestConnectedComponent(array, log)
-        if options.get("removeSmallIslands", True):
-            voxelVolumeMm3 = float(np.prod(labelmapNode.GetSpacing()))
-            array = removeSmallIslands(array, options.get("minIslandMm3", DEFAULT_MIN_ISLAND_MM3), voxelVolumeMm3, log)
+        if options["keepLargestIsland"]:
+            airway = keepLargestConnectedComponent(airway, log) > 0
+        if options["removeSmallIslands"]:
+            airway = removeSmallIslands(airway, options["minIslandMm3"], voxelVolumeMm3, log) > 0
 
         # Air handling on the labelmap grid (same as the cleaned airway, so the masks align).
         # Both features share one decomposition of the volume into a sealed head envelope:
         # air INSIDE the envelope = internal cavities (sinuses) that belong to the airway;
         # air OUTSIDE = ambient air. This is what keeps the frontal sinuses out of the
         # external-air segment and lets us fold them back into the airway.
-        externalArray = None
-        baseIJKToRAS = volumeIJKToRASArray(labelmapNode)
-        wantExternal = options.get("segmentExternalAir", False)
-        wantInternal = options.get("includeInternalAir", False)
+        external = None
+        wantExternal = bool(options["segmentExternalAir"])
+        wantInternal = bool(options["includeInternalAir"])
         if wantExternal or wantInternal:
-            voxelVolumeMm3 = float(np.prod(labelmapNode.GetSpacing()))
-            volumeArray = _volumeArrayLike(volumeNode, array)
-            threshold = _airThresholdFromAirway(volumeArray, array) if volumeArray is not None else None
-            if threshold is None:
+            volumeArray = _volumeArrayLike(volumeNode, airway)
+            threshold = _airThresholdFromAirway(volumeArray, airway)
+            sealedHead = None if threshold is None else _sealedHeadMask(volumeArray, threshold, spacing, log)
+            if sealedHead is None:
                 _log(log, "Air handling skipped: grey-level volume not available on the airway grid.")
             else:
-                sealedHead = _sealedHeadMask(volumeArray, threshold, labelmapNode.GetSpacing(), log)
                 airMask = volumeArray <= threshold
                 # Recover the internal air cavities (sinuses) the model drops, back INTO the airway.
-                # Any island cleanup above (keep-largest / remove-small) has already been applied to
-                # the main airway; the sinuses are cleaned separately here, dropping the smaller
-                # cephalostat air bubbles by size before they are merged in.
-                if wantInternal and sealedHead is not None:
-                    internal = computeInternalAirCavities(
-                        airMask, sealedHead, array, voxelVolumeMm3, log,
-                        minRegionMm3=float(options.get("minInternalAirMm3", DEFAULT_MIN_INTERNAL_AIR_MM3)),
-                    )
-                    if internal is not None and int(internal.sum()) > 0:
-                        array = ((array > 0) | (internal > 0)).astype(np.uint8)
+                # The island cleanup above has already been applied to the main airway; the sinuses
+                # are cleaned separately here, dropping the smaller cephalostat air bubbles by size
+                # before they are merged in.
+                if wantInternal:
+                    airway |= computeInternalAirCavities(
+                        airMask, sealedHead, airway, voxelVolumeMm3, log,
+                        minRegionMm3=float(options["minInternalAirMm3"]),
+                    ) > 0
                 # External air = ambient air OUTSIDE the head envelope, in front of the face.
-                if wantExternal and sealedHead is not None:
-                    externalArray = computeExternalAirMask(
-                        airMask, array, sealedHead, baseIJKToRAS, voxelVolumeMm3, log
-                    )
-                    if externalArray is not None and int(externalArray.sum()) == 0:
-                        externalArray = None
+                if wantExternal:
+                    external = computeExternalAirMask(
+                        airMask, airway, sealedHead, baseIJKToRAS, voxelVolumeMm3, log
+                    ) > 0
+                    if not external.any():
+                        external = None
 
         # Anatomical airway volume (airway plus any recovered sinuses), measured before the
         # extension pads it and before the external air is merged, so it stays clinically meaningful.
-        airwayVolumeMm3 = float(int((array > 0).sum())) * float(np.prod(labelmapNode.GetSpacing()))
+        airwayVolumeMm3 = float(np.count_nonzero(airway)) * voxelVolumeMm3
         _log(log, "Airway volume: %.2f mL (%.0f mm^3)." % (airwayVolumeMm3 / 1000.0, airwayVolumeMm3))
 
         # Extension is applied to the AIRWAY only, then (if requested) the external air is merged
         # in AFTER extension, padded onto the extended grid. This guarantees the caudal extension
         # replicates the airway's terminal slice, never the external air (which can sit lower).
-        mergeExternal = bool(options.get("mergeExternalAir", False)) and externalArray is not None
-        if options.get("extend", False) and float(options.get("lengthMm", 0.0)) > 0:
-            array, ijkToRAS, padInfo = extendBinaryArray(
-                array, labelmapNode, float(options["lengthMm"]),
-                options.get("direction", EXTENSION_DIRECTIONS[0]), log
-            )
-            if mergeExternal:
-                externalOnGrid = _padCompanionToExtendedGrid(externalArray, padInfo)
-                array = ((array > 0) | (externalOnGrid > 0)).astype(np.uint8)
-                externalArray = None
-                _log(log, "External air merged into the airway segment (after extension).")
-        else:
-            ijkToRAS = baseIJKToRAS
-            if mergeExternal:
-                array = ((array > 0) | (externalArray > 0)).astype(np.uint8)
-                externalArray = None
-                _log(log, "External air merged into the airway segment.")
+        ijkToRAS = baseIJKToRAS
+        merged = external is not None and bool(options["mergeExternalAir"])
+        if options["extend"] and float(options["lengthMm"]) > 0:
+            airway, ijkToRAS, padInfo = extendBinaryArray(airway, labelmapNode, float(options["lengthMm"]), log)
+            if merged:
+                external = _padCompanionToExtendedGrid(external, padInfo)
+        if merged:
+            airway = (airway > 0) | external
+            external = None
+            _log(log, "External air merged into the airway segment.")
 
-        node = _buildAirwaySegmentation(array, ijkToRAS, segmentationNode.GetName(), log)
+        node = _buildAirwaySegmentation(airway, ijkToRAS, segmentationNode.GetName())
         node.SetAttribute("AUAE.airwayVolumeMm3", "%.1f" % airwayVolumeMm3)
-        if externalArray is not None:
+        if external is not None:
             # Separate segment: import on the original (unextended) grid; Slicer resamples it
             # into the node's shared geometry.
-            _addExternalAirSegment(node, externalArray, baseIJKToRAS, log)
-        _applyDisplaySmoothing(node, options.get("smoothingFactor", 0.0))
+            _addExternalAirSegment(node, external, baseIJKToRAS, log)
+        applySurfaceSmoothing(node, options["smoothingFactor"])
         return node
     finally:
         slicer.mrmlScene.RemoveNode(labelmapNode)
@@ -195,64 +166,79 @@ def extendSegmentation(segmentationNode, volumeNode, options, log=None):
     "Airway" segment.
     """
     options = {**defaultOptions(), **(options or {})}
-    lengthMm = float(options.get("lengthMm", 0.0))
+    lengthMm = float(options["lengthMm"])
     if lengthMm <= 0:
         raise RuntimeError("Set an extension length greater than 0 mm.")
 
     labelmapNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLabelMapVolumeNode", "airway_tmp_labelmap")
     try:
-        if volumeNode is not None:
-            segmentationNode.SetReferenceImageGeometryParameterFromVolumeNode(volumeNode)
-        segLogic = slicer.modules.segmentations.logic()
-        exported = segLogic.ExportAllSegmentsToLabelmapNode(
-            segmentationNode, labelmapNode, slicer.vtkSegmentation.EXTENT_REFERENCE_GEOMETRY
-        )
-        if exported is False:
-            raise RuntimeError("Could not export segmentation to labelmap for extension.")
-
-        array = (slicer.util.arrayFromVolume(labelmapNode) > 0).astype(np.uint8)
-        if int(array.sum()) == 0:
-            raise RuntimeError("Segmentation is empty; nothing to extend.")
-
-        array, ijkToRAS, _padInfo = extendBinaryArray(
-            array, labelmapNode, lengthMm, options.get("direction", EXTENSION_DIRECTIONS[0]), log
-        )
-        node = _buildAirwaySegmentation(array, ijkToRAS, segmentationNode.GetName(), log)
-        _applyDisplaySmoothing(node, options.get("smoothingFactor", 0.0))
+        airway = _exportBinaryMask(segmentationNode, volumeNode, labelmapNode)
+        airway, ijkToRAS, _padInfo = extendBinaryArray(airway, labelmapNode, lengthMm, log)
+        node = _buildAirwaySegmentation(airway, ijkToRAS, segmentationNode.GetName())
+        applySurfaceSmoothing(node, options["smoothingFactor"])
         return node
     finally:
         slicer.mrmlScene.RemoveNode(labelmapNode)
 
 
-def _buildAirwaySegmentation(array, ijkToRAS, name, log=None):
-    """Rebuild a single-segment 'Airway' segmentation node from a processed binary array."""
-    processedLabelmap = slicer.util.addVolumeFromArray(
-        array.astype(np.uint8), ijkToRAS=ijkToRAS, name="airway_tmp_processed",
+def _exportBinaryMask(segmentationNode, volumeNode, labelmapNode):
+    """Export every segment of a segmentation to labelmapNode and return it as a boolean array.
+
+    The export uses the reference (volume) geometry, so the full slice stack is available for
+    the extension and the mask lines up voxel for voxel with the grey-level volume.
+    """
+    if volumeNode is not None:
+        segmentationNode.SetReferenceImageGeometryParameterFromVolumeNode(volumeNode)
+    exported = slicer.modules.segmentations.logic().ExportAllSegmentsToLabelmapNode(
+        segmentationNode, labelmapNode, slicer.vtkSegmentation.EXTENT_REFERENCE_GEOMETRY
+    )
+    if exported is False:
+        raise RuntimeError("Could not export the segmentation to a labelmap.")
+    mask = slicer.util.arrayFromVolume(labelmapNode) > 0
+    if not mask.any():
+        raise RuntimeError("The segmentation is empty; nothing to process.")
+    return mask
+
+
+def _importMaskAsSegment(segmentationNode, mask, ijkToRAS, name, color, opacity3D):
+    """Import a binary mask as a new named segment; return its id, or None if nothing came in."""
+    labelmapNode = slicer.util.addVolumeFromArray(
+        np.asarray(mask, dtype=np.uint8), ijkToRAS=ijkToRAS, name="airway_tmp_import",
         nodeClassName="vtkMRMLLabelMapVolumeNode",
     )
     try:
-        segmentationNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode", name)
-        segmentationNode.CreateDefaultDisplayNodes()
         segmentation = segmentationNode.GetSegmentation()
-        segmentation.SetConversionParameter("Smoothing factor", "0.0")
-
         beforeIds = set(_segmentIds(segmentation))
-        slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(processedLabelmap, segmentationNode)
+        slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(labelmapNode, segmentationNode)
         newIds = [sid for sid in _segmentIds(segmentation) if sid not in beforeIds]
         if not newIds:
-            raise RuntimeError("Import produced no airway segment.")
-
+            return None
         segment = segmentation.GetSegment(newIds[0])
-        segment.SetName(AIRWAY_SEGMENT_NAME)
-        segment.SetColor(*AIRWAY_SEGMENT_COLOR)
+        segment.SetName(name)
+        segment.SetColor(*color)
         displayNode = segmentationNode.GetDisplayNode()
         if displayNode is not None:
-            displayNode.SetSegmentOpacity3D(newIds[0], 0.8)
-
-        segmentationNode.CreateClosedSurfaceRepresentation()  # replaces the removed Show3D button
-        return segmentationNode
+            displayNode.SetSegmentOpacity3D(newIds[0], opacity3D)
+        return newIds[0]
     finally:
-        slicer.mrmlScene.RemoveNode(processedLabelmap)
+        slicer.mrmlScene.RemoveNode(labelmapNode)
+
+
+def _buildAirwaySegmentation(mask, ijkToRAS, name):
+    """Build a segmentation node carrying a single 'Airway' segment from a binary mask.
+
+    The closed surface is not generated here: the caller finishes with applySurfaceSmoothing,
+    which builds it once with the right smoothing factor.
+    """
+    segmentationNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode", name)
+    segmentationNode.CreateDefaultDisplayNodes()
+    segmentId = _importMaskAsSegment(
+        segmentationNode, mask, ijkToRAS, AIRWAY_SEGMENT_NAME, AIRWAY_SEGMENT_COLOR, 0.8
+    )
+    if segmentId is None:
+        slicer.mrmlScene.RemoveNode(segmentationNode)
+        raise RuntimeError("Import produced no airway segment.")
+    return segmentationNode
 
 
 def _segmentIds(segmentation):
@@ -271,119 +257,94 @@ def volumeIJKToRASArray(volumeNode):
     return slicer.util.arrayFromVTKMatrix(ijkToRASVtk)
 
 
-def sliceSCoordinate(sliceIndex, arrayShape, ijkToRAS):
-    """RAS-S (cranio-caudal height) of the centre of a given array slice.
+def inferiorStackSide(arrayShape, ijkToRAS):
+    """Return which end of the slice stack ('min' or 'max') is anatomically inferior.
 
-    Used to decide which end of the slice stack is anatomically inferior: comparing the
-    S of the first and last slice tells where the neck is, regardless of orientation.
-    Note the KJI->IJK index reversal before the matrix product, and that S is row 2.
+    The extension always grows towards the neck. The RAS-S (cranio-caudal) coordinate of the
+    centre of the first and last slice is compared, so the right end is chosen whatever the
+    patient orientation stored in the IJK->RAS matrix. Note the KJI->IJK index reversal
+    before the matrix product, and that S is row 2.
     """
-    centerArray = [
-        (arrayShape[0] - 1) / 2.0,
-        (arrayShape[1] - 1) / 2.0,
-        (arrayShape[2] - 1) / 2.0,
-    ]
-    centerArray[AXIS] = float(sliceIndex)
-    ijk = np.array([centerArray[2], centerArray[1], centerArray[0], 1.0])
-    ras = ijkToRAS @ ijk
-    return float(ras[2])
+    def sliceS(sliceIndex):
+        center = [(n - 1) / 2.0 for n in arrayShape]
+        center[AXIS] = float(sliceIndex)
+        return float((ijkToRAS @ np.array([center[2], center[1], center[0], 1.0]))[2])
+
+    return "min" if sliceS(0) < sliceS(arrayShape[AXIS] - 1) else "max"
 
 
-# The three helpers below abstract per-slice access along AXIS: they build the correct
-# NumPy index at runtime (slice(None) on every axis but AXIS) instead of hardcoding
-# array[i] / array[:, i]. The extension logic stays independent of which axis is the stack.
-def getAxisSlice(array, sliceIndex):
-    """Extract the 2D slice of given index along the stack axis (AXIS)."""
-    return np.take(array, sliceIndex, axis=AXIS)
+def _axisWindow(ndim, start, stop):
+    """Index tuple selecting the slices [start, stop) along AXIS and everything on the others."""
+    window = [slice(None)] * ndim
+    window[AXIS] = slice(start, stop)
+    return tuple(window)
 
 
-def setAxisSlice(array, sliceIndex, slice2d):
-    """Overwrite in place the slice of given index along AXIS with a 2D slice."""
-    sliceTuple = [slice(None)] * array.ndim
-    sliceTuple[AXIS] = sliceIndex
-    array[tuple(sliceTuple)] = slice2d
+def _labelComponents(mask):
+    """Label the connected components of a mask: (labels, voxels per label), background at 0.
 
-
-def copyArrayIntoAxisRange(destination, startIndex, source):
-    """Paste 'source' into 'destination' in a contiguous window along AXIS.
-
-    Used to place the original mask inside the larger extended array: the window
-    [startIndex, startIndex+length) leaves the newly added slices free to be filled.
+    Returns (None, None) when scipy is missing, so callers can degrade to a no-op.
     """
-    sliceTuple = [slice(None)] * destination.ndim
-    sliceTuple[AXIS] = slice(startIndex, startIndex + source.shape[AXIS])
-    destination[tuple(sliceTuple)] = source
+    try:
+        from scipy import ndimage
+    except Exception:  # noqa: BLE001
+        return None, None
+    labeled, _count = ndimage.label(mask)
+    sizes = np.bincount(labeled.ravel())
+    sizes[0] = 0  # background never counts as a component
+    return labeled, sizes
 
 
-def resolveExtensionSideForDirection(direction, arrayShape, ijkToRAS):
-    """Map an anatomical or array direction onto the min/max end of the KJI stack.
+def _dropSmallComponents(mask, minVoxels):
+    """Boolean mask without the components smaller than minVoxels, and how many were dropped.
 
-    'Array min'/'Array max' are deterministic and ignore geometry (handy for tests).
-    'Inferior'/'Superior' are resolved from the RAS-S of the two ends, so the correct
-    end is chosen whatever the patient orientation stored in the IJK->RAS matrix.
+    Selection goes through a per-label lookup table (keep[labeled]), which is a single pass
+    over the volume and far cheaper than np.isin on a full-size label array.
     """
-    direction = (direction or "").lower()
-    if "array min" in direction:
-        return "min"
-    if "array max" in direction:
-        return "max"
-    minS = sliceSCoordinate(0, arrayShape, ijkToRAS)
-    maxS = sliceSCoordinate(arrayShape[AXIS] - 1, arrayShape, ijkToRAS)
-    if "superior" in direction:
-        return "min" if minS > maxS else "max"
-    return "min" if minS < maxS else "max"
+    mask = np.asarray(mask) > 0
+    if minVoxels <= 1:
+        return mask, 0
+    labeled, sizes = _labelComponents(mask)
+    if labeled is None:
+        return mask, 0
+    keep = sizes >= minVoxels
+    dropped = int(np.count_nonzero(sizes)) - int(np.count_nonzero(keep))
+    return (keep[labeled] if dropped else mask), dropped
+
+
+def _minVoxels(minSizeMm3, voxelVolumeMm3):
+    """Voxel count matching a physical volume threshold (0 when the spacing is unusable)."""
+    if voxelVolumeMm3 <= 0:
+        return 0
+    return int(np.ceil(float(minSizeMm3) / float(voxelVolumeMm3)))
 
 
 def keepLargestConnectedComponent(array, log=None):
-    """Keep only the largest connected component, dropping spurious isolated voxels."""
-    try:
-        from scipy import ndimage
-    except Exception as exc:  # noqa: BLE001
-        _log(log, "Keep largest island skipped; scipy unavailable: " + str(exc))
-        return array.astype(np.uint8)
-
-    labeled, count = ndimage.label(array > 0)
+    """Keep only the largest connected component, dropping every other island."""
+    mask = np.asarray(array) > 0
+    labeled, sizes = _labelComponents(mask)
+    if labeled is None:
+        _log(log, "Keep largest island skipped: scipy is unavailable.")
+        return mask.astype(np.uint8)
+    count = int(np.count_nonzero(sizes))
     if count <= 1:
-        return array.astype(np.uint8)
-    sizes = np.bincount(labeled.ravel())
-    sizes[0] = 0  # exclude background so argmax picks the main airway
-    largestLabel = int(np.argmax(sizes))
-    if log:
-        _log(log, "Keep largest island: kept label %d of %d." % (largestLabel, count))
-    return (labeled == largestLabel).astype(np.uint8)
+        return mask.astype(np.uint8)
+    _log(log, "Keep largest island: kept 1 of %d component(s)." % count)
+    return (labeled == int(np.argmax(sizes))).astype(np.uint8)
 
 
 def removeSmallIslands(array, minSizeMm3, voxelVolumeMm3, log=None):
     """Remove connected components smaller than a physical volume threshold.
 
-    Replaces the upstream Segment Editor "Islands / remove small islands" effect, which
-    is no longer available once the embedded editor is removed. The threshold matches the
-    upstream default (200 voxels at 0.3 mm isotropic) but is expressed in mm^3 so it is
-    correct for any spacing.
+    The automatic counterpart of the Segment Editor "Islands / remove small islands" effect.
+    The default threshold matches upstream (200 voxels at 0.3 mm isotropic) but is expressed
+    in mm^3, so it is correct for any spacing.
     """
-    try:
-        from scipy import ndimage
-    except Exception as exc:  # noqa: BLE001
-        _log(log, "Remove small islands skipped; scipy unavailable: " + str(exc))
-        return array.astype(np.uint8)
-
-    if voxelVolumeMm3 <= 0:
-        return array.astype(np.uint8)
-    minVoxels = int(np.ceil(float(minSizeMm3) / float(voxelVolumeMm3)))
-    if minVoxels <= 1:
-        return array.astype(np.uint8)
-
-    labeled, count = ndimage.label(array > 0)
-    if count == 0:
-        return array.astype(np.uint8)
-    sizes = np.bincount(labeled.ravel())
-    keptLabels = np.where(sizes >= minVoxels)[0]
-    keptLabels = keptLabels[keptLabels != 0]  # never keep background
-    cleaned = np.isin(labeled, keptLabels).astype(np.uint8)
-    if log:
-        removed = count - len(keptLabels)
-        _log(log, "Remove small islands: dropped %d component(s) < %d voxels." % (removed, minVoxels))
-    return cleaned
+    minVoxels = _minVoxels(minSizeMm3, voxelVolumeMm3)
+    cleaned, dropped = _dropSmallComponents(array, minVoxels)
+    if dropped:
+        _log(log, "Remove small islands: dropped %d component(s) < %d voxels." % (dropped, minVoxels))
+    return cleaned.astype(np.uint8)
 
 
 def _volumeArrayLike(volumeNode, referenceArray):
@@ -397,19 +358,29 @@ def _volumeArrayLike(volumeNode, referenceArray):
     return vol if vol is not None and vol.shape == referenceArray.shape else None
 
 
-def _rasComponentField(shape, ijkToRAS, rasRow):
-    """Per-voxel value of one RAS component (0=R, 1=A, 2=S) over a KJI array of given shape.
+def _rasRamps(shape, ijkToRAS, rasRow):
+    """One RAS component (0=R, 1=A, 2=S) of a KJI grid, as an offset plus three 1-D ramps.
 
-    The affine is separable, so the field is built from three 1-D ramps instead of a full
-    matrix product per voxel. Array axes are KJI, hence the K/J/I coefficients are columns
-    2/1/0 of the chosen RAS row.
+    The affine is separable: the component at voxel (k, j, i) is
+    offset + kRamp[k] + jRamp[j] + iRamp[i]. Array axes are KJI, hence the K/J/I coefficients
+    are columns 2/1/0 of the chosen RAS row. Working from the ramps avoids ever allocating a
+    full-size float field, which on a large CBCT would cost about a gigabyte.
     """
     nK, nJ, nI = shape
     row = ijkToRAS[rasRow]
-    kRamp = np.arange(nK) * row[2]
-    jRamp = np.arange(nJ) * row[1]
-    iRamp = np.arange(nI) * row[0]
-    return row[3] + kRamp[:, None, None] + jRamp[None, :, None] + iRamp[None, None, :]
+    return float(row[3]), np.arange(nK) * row[2], np.arange(nJ) * row[1], np.arange(nI) * row[0]
+
+
+def _clipToAnteriorOf(mask, referenceMask, ijkToRAS):
+    """Keep, in place, only the voxels of mask anterior to the median A of referenceMask."""
+    offset, kRamp, jRamp, iRamp = _rasRamps(mask.shape, ijkToRAS, 1)  # RAS 'A' (anterior +)
+    k, j, i = np.nonzero(referenceMask)
+    if k.size == 0:
+        return
+    cutoff = float(np.median(offset + kRamp[k] + jRamp[j] + iRamp[i]))
+    plane = offset + jRamp[:, None] + iRamp[None, :]
+    for index in range(mask.shape[0]):  # slice by slice: the memory stays one 2-D plane
+        mask[index] &= (plane + kRamp[index]) >= cutoff
 
 
 def _airThresholdFromAirway(volumeArray, airwayArray):
@@ -441,27 +412,27 @@ def _sealedHeadMask(volumeArray, threshold, spacingIJK, log=None):
     except Exception as exc:  # noqa: BLE001
         _log(log, "Air envelope skipped; scipy unavailable: " + str(exc))
         return None
-    tissue = volumeArray > threshold
-    labeled, count = ndimage.label(tissue)
-    if count > 1:
-        sizes = np.bincount(labeled.ravel())
-        sizes[0] = 0
-        tissue = labeled == int(np.argmax(sizes))  # the patient, not the table or props
+    fullShape = volumeArray.shape
 
-    # The head envelope is a coarse structure, so on large volumes the closing and hole-fill run
-    # on a downsampled copy and the result is resized back. This keeps the cost bounded without
-    # changing the envelope meaningfully; small volumes are processed at full resolution.
+    # The head envelope is a coarse structure, so on large volumes the whole computation
+    # (labelling included) runs on a downsampled copy and the result is resized back. This
+    # keeps time and memory bounded without changing the envelope meaningfully; small volumes
+    # are processed at full resolution.
+    factor = 2 if volumeArray.size > 12_000_000 else 1
+    tissue = (volumeArray[::factor, ::factor, ::factor] if factor > 1 else volumeArray) > threshold
+
+    labeled, sizes = _labelComponents(tissue)
+    if np.count_nonzero(sizes) > 1:
+        tissue = labeled == int(np.argmax(sizes))  # the patient, not the table or props
+    del labeled
+
+    # Seal openings of about 3 mm; the iteration count scales with the working voxel size.
     minSpacing = min([float(s) for s in spacingIJK if float(s) > 0] or [1.0])
-    factor = 2 if tissue.size > 12_000_000 else 1
+    iterations = max(1, min(8, int(round(3.0 / (minSpacing * factor)))))
+    sealed = ndimage.binary_fill_holes(ndimage.binary_closing(tissue, iterations=iterations))
     if factor > 1:
-        small = tissue[::factor, ::factor, ::factor]
-        iterations = max(1, min(8, int(round(3.0 / (minSpacing * factor)))))
-        sealedSmall = ndimage.binary_fill_holes(ndimage.binary_closing(small, iterations=iterations))
-        sealed = _upsampleNearest(sealedSmall, tissue.shape, factor)
+        sealed = _upsampleNearest(sealed, fullShape, factor)
         _log(log, "Air envelope computed at 1/%d resolution for speed." % factor)
-    else:
-        iterations = max(1, min(8, int(round(3.0 / minSpacing))))
-        sealed = ndimage.binary_fill_holes(ndimage.binary_closing(tissue, iterations=iterations))
     return sealed
 
 
@@ -483,25 +454,12 @@ def computeInternalAirCavities(airMask, sealedHead, airwayArray, voxelVolumeMm3,
     all-zero array means 'nothing to add'.
     """
     if sealedHead is None:
-        return np.zeros_like(airwayArray, dtype=np.uint8)
-    try:
-        from scipy import ndimage
-    except Exception as exc:  # noqa: BLE001
-        _log(log, "Internal air skipped; scipy unavailable: " + str(exc))
-        return np.zeros_like(airwayArray, dtype=np.uint8)
-    internal = (airMask & sealedHead)
-    internal[airwayArray > 0] = False
-    minVox = int(np.ceil(float(minRegionMm3) / max(float(voxelVolumeMm3), 1e-6)))
-    if minVox > 1:
-        labeled, count = ndimage.label(internal)
-        if count > 0:
-            sizes = np.bincount(labeled.ravel())
-            sizes[0] = 0
-            keep = np.where(sizes >= minVox)[0]
-            internal = np.isin(labeled, keep)
-    result = internal.astype(np.uint8)
-    _log(log, "Internal air cavities (sinuses) recovered for the airway: %d voxels." % int(result.sum()))
-    return result
+        return np.zeros(np.shape(airwayArray), dtype=np.uint8)
+    internal = airMask & sealedHead & ~(np.asarray(airwayArray) > 0)
+    internal, _dropped = _dropSmallComponents(internal, _minVoxels(minRegionMm3, voxelVolumeMm3))
+    _log(log, "Internal air cavities (sinuses) recovered for the airway: %d voxels."
+         % int(np.count_nonzero(internal)))
+    return internal.astype(np.uint8)
 
 
 def computeExternalAirMask(airMask, airwayArray, sealedHead, ijkToRAS, voxelVolumeMm3, log=None,
@@ -513,158 +471,123 @@ def computeExternalAirMask(airMask, airwayArray, sealedHead, ijkToRAS, voxelVolu
     border and to the region anterior to the airway (the 'front of the face'), with the airway
     and negligible specks removed. Returns a uint8 array; an all-zero array means 'not found'.
     """
+    empty = np.zeros(np.shape(airwayArray), dtype=np.uint8)
     if sealedHead is None:
-        return np.zeros_like(airwayArray, dtype=np.uint8)
-    try:
-        from scipy import ndimage
-    except Exception as exc:  # noqa: BLE001
-        _log(log, "External air skipped; scipy unavailable: " + str(exc))
-        return np.zeros_like(airwayArray, dtype=np.uint8)
+        return empty
+    airway = np.asarray(airwayArray) > 0
+    external = airMask & ~sealedHead & ~airway  # air strictly outside the head envelope
 
-    external = (airMask & ~sealedHead)  # air strictly outside the head envelope
-    external[airwayArray > 0] = False
-
-    labeled, count = ndimage.label(external)
-    if count == 0:
-        return np.zeros_like(airwayArray, dtype=np.uint8)
-    borderLabels = set()
-    for face in (labeled[0], labeled[-1], labeled[:, 0], labeled[:, -1], labeled[:, :, 0], labeled[:, :, -1]):
-        borderLabels.update(int(v) for v in np.unique(face))
-    borderLabels.discard(0)
-    if not borderLabels:
-        return np.zeros_like(airwayArray, dtype=np.uint8)
-    external = np.isin(labeled, list(borderLabels))  # the ambient air around the patient
+    labeled, sizes = _labelComponents(external)
+    if labeled is None:
+        _log(log, "External air skipped: scipy is unavailable.")
+        return empty
+    faces = (labeled[0], labeled[-1], labeled[:, 0], labeled[:, -1], labeled[:, :, 0], labeled[:, :, -1])
+    touchesBorder = np.zeros(sizes.shape, dtype=bool)
+    touchesBorder[np.unique(np.concatenate([face.ravel() for face in faces]))] = True
+    touchesBorder[0] = False
+    if not touchesBorder.any():
+        return empty
+    external = touchesBorder[labeled]  # the ambient air around the patient
+    del labeled
 
     # Clip to the front of the face: keep voxels anterior to the airway's mid A-coordinate.
     try:
-        aField = _rasComponentField(airwayArray.shape, ijkToRAS, 1)  # RAS 'A' (anterior +)
-        airwayA = aField[airwayArray > 0]
-        if airwayA.size:
-            external = external & (aField >= float(np.median(airwayA)))
+        _clipToAnteriorOf(external, airway, ijkToRAS)
     except Exception as exc:  # noqa: BLE001
         _log(log, "External air: anterior clip skipped (%s); keeping full ambient air." % exc)
 
-    minVox = int(np.ceil(float(minRegionMm3) / max(float(voxelVolumeMm3), 1e-6)))
-    if minVox > 1:
-        lab2, c2 = ndimage.label(external)
-        if c2 > 0:
-            sizes = np.bincount(lab2.ravel())
-            sizes[0] = 0
-            keep = np.where(sizes >= minVox)[0]
-            external = np.isin(lab2, keep)
-    result = external.astype(np.uint8)
-    _log(log, "External face air: %d voxels." % int(result.sum()))
-    return result
+    external, _dropped = _dropSmallComponents(external, _minVoxels(minRegionMm3, voxelVolumeMm3))
+    _log(log, "External face air: %d voxels." % int(np.count_nonzero(external)))
+    return external.astype(np.uint8)
 
 
-def _addExternalAirSegment(segmentationNode, externalArray, ijkToRAS, log=None):
+def _addExternalAirSegment(segmentationNode, externalMask, ijkToRAS, log=None):
     """Import the external-air mask as a second, distinctly coloured segment in the node."""
-    tmp = slicer.util.addVolumeFromArray(
-        externalArray.astype(np.uint8), ijkToRAS=ijkToRAS, name="external_air_tmp",
-        nodeClassName="vtkMRMLLabelMapVolumeNode",
+    segmentId = _importMaskAsSegment(
+        segmentationNode, externalMask, ijkToRAS, EXTERNAL_AIR_SEGMENT_NAME, EXTERNAL_AIR_SEGMENT_COLOR, 0.4
     )
+    _log(log, "External air added as a separate segment." if segmentId
+         else "External air import produced no segment.")
+
+
+def applySurfaceSmoothing(segmentationNode, factor):
+    """Set the closed-surface smoothing factor (0-1) and (re)build the surface when needed.
+
+    The surface feeds the 3D view and the STL/OBJ export. Generating it is the slowest part of
+    the display path, so nothing happens when the node already carries a surface built with the
+    same factor.
+    """
     try:
+        factor = min(1.0, max(0.0, float(factor)))
         segmentation = segmentationNode.GetSegmentation()
-        beforeIds = set(_segmentIds(segmentation))
-        slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(tmp, segmentationNode)
-        newIds = [sid for sid in _segmentIds(segmentation) if sid not in beforeIds]
-        if not newIds:
-            _log(log, "External air import produced no segment.")
+        surfaceName = slicer.vtkSegmentationConverter.GetSegmentationClosedSurfaceRepresentationName()
+        try:
+            current = float(segmentation.GetConversionParameter("Smoothing factor"))
+        except (TypeError, ValueError):
+            current = None
+        if current is not None and abs(current - factor) < 1e-6 and segmentation.ContainsRepresentation(surfaceName):
             return
-        segment = segmentation.GetSegment(newIds[0])
-        segment.SetName(EXTERNAL_AIR_SEGMENT_NAME)
-        segment.SetColor(*EXTERNAL_AIR_SEGMENT_COLOR)
-        displayNode = segmentationNode.GetDisplayNode()
-        if displayNode is not None:
-            displayNode.SetSegmentOpacity3D(newIds[0], 0.4)
-        segmentationNode.CreateClosedSurfaceRepresentation()
-        _log(log, "External air added as a separate segment.")
-    finally:
-        slicer.mrmlScene.RemoveNode(tmp)
-
-
-def _applyDisplaySmoothing(segmentationNode, factor):
-    """Set the closed-surface smoothing factor (0-1) and rebuild the surface for display/export."""
-    try:
-        factor = float(factor)
-    except Exception:  # noqa: BLE001
-        return
-    try:
-        segmentationNode.GetSegmentation().SetConversionParameter("Smoothing factor", str(factor))
+        segmentation.SetConversionParameter("Smoothing factor", str(factor))
         segmentationNode.RemoveClosedSurfaceRepresentation()
         segmentationNode.CreateClosedSurfaceRepresentation()
     except Exception:  # noqa: BLE001
-        pass
+        pass  # display-only: a failed surface rebuild must never break the pipeline
 
 
-def extendBinaryArray(array, referenceNode, extensionMm, direction, log=None):
-    """Extend the final binary mask by repeating its terminal non-empty slice.
+def extendBinaryArray(array, referenceNode, extensionMm, log=None):
+    """Extend a binary mask inferiorly by repeating its terminal non-empty slice.
 
-    The requested length is applied in two steps (absorbing the old standalone extend
-    logic): (1) fill the gap between the mask's terminal slice and the volume border,
-    staying inside the acquired field of view; (2) if more is requested, grow the array
-    beyond the border and replicate the terminal slice into the new slices. The IJK->RAS
-    matrix is shifted when the array grows on the 'min' side so the extended mask stays
-    connected and correctly positioned in space.
+    The requested length is consumed in two steps: (1) fill the gap between the mask's terminal
+    slice and the volume border, staying inside the acquired field of view; (2) if more is
+    requested, grow the array beyond the border and replicate the terminal slice into the new
+    slices. The IJK->RAS matrix is shifted when the array grows on the 'min' side, so the
+    extended mask stays connected and correctly positioned in space.
 
     Returns (extendedArray, ijkToRAS, padInfo) where padInfo = (side, slicesAddedOutside).
     padInfo lets a companion mask (e.g. the external air) be padded onto the same extended grid
     with _padCompanionToExtendedGrid, so it can be unioned in AFTER the extension.
     """
-    nonEmpty = np.where(np.any(array > 0, axis=tuple(i for i in range(3) if i != AXIS)))[0]
-    if len(nonEmpty) == 0:
-        raise RuntimeError("Cannot extend an empty final segmentation.")
-
-    spacingIJK = referenceNode.GetSpacing()
-    arraySpacing = [spacingIJK[2], spacingIJK[1], spacingIJK[0]]
-    stepMm = float(arraySpacing[AXIS])
-    slicesToAdd = int(round(float(extensionMm) / stepMm)) if stepMm > 0 else 0
-    if slicesToAdd <= 0:
-        return array.astype(np.uint8), volumeIJKToRASArray(referenceNode), (None, 0)
+    mask = np.asarray(array) > 0
+    occupied = np.flatnonzero(mask.any(axis=tuple(a for a in range(mask.ndim) if a != AXIS)))
+    if occupied.size == 0:
+        raise RuntimeError("Cannot extend an empty segmentation.")
 
     ijkToRAS = volumeIJKToRASArray(referenceNode)
-    extendSide = resolveExtensionSideForDirection(direction, array.shape, ijkToRAS)
-    edgeIndex = int(nonEmpty.min()) if extendSide == "min" else int(nonEmpty.max())
-    edgeSlice = getAxisSlice(array, edgeIndex).copy()
-    axisLength = array.shape[AXIS]
+    stepMm = float(referenceNode.GetSpacing()[NUMPY_AXIS_TO_IJK_AXIS[AXIS]])
+    slicesToAdd = int(round(float(extensionMm) / stepMm)) if stepMm > 0 else 0
+    if slicesToAdd <= 0:
+        return mask.astype(np.uint8), ijkToRAS, (None, 0)
 
-    # Step 1: fill the in-FOV gap towards the volume border, working on a copy.
-    filled = array.copy()
-    gapSlices = edgeIndex if extendSide == "min" else (axisLength - 1 - edgeIndex)
-    slicesToFillInside = min(slicesToAdd, gapSlices)
-    for step in range(1, slicesToFillInside + 1):
-        insideIndex = edgeIndex - step if extendSide == "min" else edgeIndex + step
-        setAxisSlice(filled, insideIndex, edgeSlice)
-    if slicesToFillInside > 0 and log:
-        _log(log, "Extension: %d slice(s) filled inside the acquired FOV." % slicesToFillInside)
+    side = inferiorStackSide(mask.shape, ijkToRAS)
+    edgeIndex = int(occupied[0] if side == "min" else occupied[-1])
+    edgeSlice = mask[_axisWindow(mask.ndim, edgeIndex, edgeIndex + 1)]  # kept 3-D so it broadcasts
 
-    # Step 2: if the request exceeds the in-FOV gap, grow the array beyond the border.
-    slicesToAddOutside = slicesToAdd - slicesToFillInside
-    if slicesToAddOutside <= 0:
-        return filled.astype(np.uint8), volumeIJKToRASArray(referenceNode), (extendSide, 0)
+    # How much of the request fits inside the field of view, and how much has to be added outside.
+    gapSlices = edgeIndex if side == "min" else mask.shape[AXIS] - 1 - edgeIndex
+    inside = min(slicesToAdd, gapSlices)
+    outside = slicesToAdd - inside
 
-    oldShape = list(filled.shape)
-    newShape = oldShape.copy()
-    newShape[AXIS] += slicesToAddOutside
-    extended = np.zeros(newShape, dtype=np.uint8)
+    padWidth = [(0, 0)] * mask.ndim
+    padWidth[AXIS] = (outside, 0) if side == "min" else (0, outside)
+    extended = np.pad(mask.astype(np.uint8), padWidth, mode="constant")  # also the working copy
 
-    if extendSide == "min":
-        copyArrayIntoAxisRange(extended, slicesToAddOutside, filled)
-        for sliceIndex in range(slicesToAddOutside):
-            setAxisSlice(extended, sliceIndex, edgeSlice)
-        shiftVoxel = np.array([0.0, 0.0, 0.0, 0.0])
-        shiftVoxel[NUMPY_AXIS_TO_IJK_AXIS[AXIS]] = -slicesToAddOutside
-        shiftRAS = ijkToRAS @ shiftVoxel
-        ijkToRAS[0:3, 3] += shiftRAS[0:3]
+    # One broadcast assignment fills both the in-FOV gap and the newly added slices.
+    if side == "min":
+        extended[_axisWindow(mask.ndim, edgeIndex - inside, edgeIndex + outside)] = edgeSlice
     else:
-        copyArrayIntoAxisRange(extended, 0, filled)
-        start = oldShape[AXIS]
-        for offset in range(slicesToAddOutside):
-            setAxisSlice(extended, start + offset, edgeSlice)
+        extended[_axisWindow(mask.ndim, edgeIndex + 1, edgeIndex + 1 + slicesToAdd)] = edgeSlice
 
-    if log:
-        _log(log, "Extension: %d slice(s) added beyond the volume (side=%s)." % (slicesToAddOutside, extendSide))
-    return extended.astype(np.uint8), ijkToRAS, (extendSide, slicesToAddOutside)
+    if outside and side == "min":
+        # The origin moves with the slices prepended in front of index 0.
+        shiftVoxel = np.zeros(4)
+        shiftVoxel[NUMPY_AXIS_TO_IJK_AXIS[AXIS]] = -outside
+        ijkToRAS[0:3, 3] += (ijkToRAS @ shiftVoxel)[0:3]
+
+    if inside:
+        _log(log, "Extension: %d slice(s) filled inside the acquired FOV." % inside)
+    if outside:
+        _log(log, "Extension: %d slice(s) added beyond the volume (side=%s)." % (outside, side))
+    return extended, ijkToRAS, (side, outside)
 
 
 def _padCompanionToExtendedGrid(companion, padInfo):

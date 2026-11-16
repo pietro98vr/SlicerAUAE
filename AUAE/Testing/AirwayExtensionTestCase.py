@@ -44,19 +44,35 @@ def _phantom():
     return vol, airway, sinus, bubble
 
 
-def test_ras_component_field_matches_affine():
+def test_ras_ramps_match_affine():
     rng = np.random.default_rng(0)
     aff = np.eye(4)
     aff[:3, :3] = rng.normal(size=(3, 3))
     aff[:3, 3] = rng.normal(size=3)
     shape = (7, 9, 11)
-    field = AE._rasComponentField(shape, aff, 1)
+    offset, kRamp, jRamp, iRamp = AE._rasRamps(shape, aff, 1)
     worst = 0.0
     for _ in range(200):
         k, j, i = (int(rng.integers(n)) for n in shape)
         ras = aff @ np.array([i, j, k, 1.0])
-        worst = max(worst, abs(ras[1] - field[k, j, i]))
+        worst = max(worst, abs(ras[1] - (offset + kRamp[k] + jRamp[j] + iRamp[i])))
     assert worst < 1e-9
+
+
+def test_extension_fills_inside_the_field_of_view_first():
+    volumeNode = _makeVolumeNode((40, 40, 40), SPACING)
+    try:
+        airway = np.zeros((40, 40, 40), np.uint8)
+        airway[10:35, 18:22, 18:22] = 1          # 10 empty slices below the inferior end
+        extended, _ijk, (side, nout) = AE.extendBinaryArray(airway, volumeNode, 3.0)  # 6 slices
+        assert (side, nout) == ("min", 0)        # the request fits inside the scan
+        assert extended.shape == airway.shape
+        assert extended[4:10, 18:22, 18:22].all()    # the gap is filled with the edge slice
+        assert not extended[:4].any()                # and nothing beyond the requested length
+        assert np.array_equal(extended[10:], airway[10:])
+    finally:
+        import slicer
+        slicer.mrmlScene.RemoveNode(volumeNode)
 
 
 def test_sinus_recovered_and_bubble_removed():
@@ -91,7 +107,7 @@ def test_extension_returns_pad_info_and_merges_airway_only():
         airway[5:35, 18:22, 18:22] = 1           # inferior end at K = 5 (min side)
         companion = np.zeros((40, 40, 40), np.uint8)
         companion[10:20, 5:9, 5:9] = 1           # a lower blob to stand in for external air
-        extended, ijk, pad = AE.extendBinaryArray(airway, volumeNode, 10.0, "Inferior (neck)", None)
+        extended, ijk, pad = AE.extendBinaryArray(airway, volumeNode, 10.0)
         padded = AE._padCompanionToExtendedGrid(companion, pad)
         side, nout = pad
         assert side == "min" and nout > 0

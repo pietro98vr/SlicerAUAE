@@ -1,18 +1,19 @@
 """Main module widget.
 
 This is based on capenaka/SlicerUpperAirwaySegmentator. The upstream automatic nnU-Net
-segmentation core (input selection, weight download, inference through SlicerNNUNetLib) and
-the multi-format export (STL/OBJ/NIFTI) are kept as-is. The changes are:
+segmentation core (input selection, weight download, inference through SlicerNNUNetLib) is
+kept. The changes are:
 
-  * automatic island cleanup is done in NumPy during the segmentation step (see
-    AirwayExtension), replacing the upstream "Islands" effect; a non-destructive surface
+  * the mask is post-processed in NumPy during the segmentation step (see AirwayExtension):
+    island cleanup, sinus recovery, optional external face air; a non-destructive surface
     smoothing slider controls the exported mesh;
   * segmentation, refinement and airway extension are three separate steps: "Apply" segments
     and cleans the mask; an embedded Segment Editor (qMRMLSegmentEditorWidget), placed between
     segmentation and extension, lets the user refine the mask (paint, erase, islands, mask
-    smoothing); then "Run airway extension" extends the selected segmentation;
-  * a "Batch processing" section runs a JSON-defined list of volumes into per-volume output
-    subfolders;
+    smoothing); then "Run airway extension" extends the selected segmentation inferiorly;
+  * the export writes STL/OBJ meshes and NIFTI/NRRD labelmaps, per segment or merged;
+  * a "Batch processing" section runs a folder of inputs, or a JSON template, into per-case
+    output subfolders;
   * a "Dependencies & CUDA" section reports required-vs-installed versions and installs
     everything needed the Slicer-compliant way (via the NNUNet + PyTorch extensions).
 """
@@ -28,6 +29,8 @@ import vtk
 
 from . import AirwayExtension
 from . import Dependencies
+from . import LlmApi
+from . import Progress
 from . import BatchProcessor as BatchProcessorLib
 from .IconPath import icon, iconPath
 from .PythonDependencyChecker import PythonDependencyChecker
@@ -60,6 +63,7 @@ class SegmentationWidget(qt.QWidget):
         super().__init__(parent)
         self.logic = logic or self._createSlicerSegmentationLogic()
         self._prevSegmentationNode = None
+        self._lastExportFolder = ""
         self.segmentEditorNode = None
         self.segmentEditorWidget = None
 
@@ -101,10 +105,21 @@ class SegmentationWidget(qt.QWidget):
         self.fullInfoLogs = []
 
         self.stopButton = createButton("Stop", callback=self.onStopClicked, toolTip="Click to Stop the segmentation.")
+        # Progress of the run in hand: one bar for a single segmentation and for a batch (where
+        # it covers the whole batch), with a line saying which case and stage it is at.
+        self._runTracker = None
+        self.runProgressBar = qt.QProgressBar(self)
+        self.runProgressBar.setRange(0, 1000)
+        self.runProgressBar.setVisible(False)
+        self.runStageLabel = qt.QLabel("", self)
+        self.runStageLabel.setVisible(False)
+
         self.stopWidget = qt.QWidget(self)
         stopLayout = qt.QVBoxLayout(self.stopWidget)
         stopLayout.setContentsMargins(0, 0, 0, 0)
         stopLayout.addWidget(self.stopButton)
+        stopLayout.addWidget(self.runProgressBar)
+        stopLayout.addWidget(self.runStageLabel)
         stopLayout.addWidget(self.currentInfoTextEdit)
         self.stopWidget.setVisible(False)
         self.loading = qt.QMovie(iconPath("loading.gif"))
@@ -132,6 +147,7 @@ class SegmentationWidget(qt.QWidget):
 
         addInCollapsibleLayout(self._createBatchWidget(), layout, "Batch processing", isCollapsed=True)
         addInCollapsibleLayout(self._createDependenciesWidget(), layout, "Dependencies && CUDA", isCollapsed=True)
+        addInCollapsibleLayout(self._createLlmApiWidget(), layout, "LLM API support (MCP)", isCollapsed=True)
 
         layout.addStretch()
 
@@ -144,6 +160,12 @@ class SegmentationWidget(qt.QWidget):
         self.sceneCloseObserver = slicer.mrmlScene.AddObserver(slicer.mrmlScene.EndCloseEvent, self.onSceneChanged)
         self.onSceneChanged(doStopInference=False)
         self._connectSegmentationLogic()
+
+        # Fill the hardware summary once the panel is up, and pick up an installation that was
+        # waiting for a restart.
+        qt.QTimer.singleShot(0, self._updateDependencySummary)
+        if Dependencies.isResumePending():
+            qt.QTimer.singleShot(500, self._resumeDependencyInstall)
 
     # ------------------------------------------------------------------ UI builders ---
     def _createPostprocessWidget(self):
@@ -245,22 +267,13 @@ class SegmentationWidget(qt.QWidget):
             except Exception:  # noqa: BLE001
                 pass
 
-    @staticmethod
-    def _applySmoothing(segmentationNode, factor):
-        try:
-            segmentationNode.GetSegmentation().SetConversionParameter("Smoothing factor", str(float(factor)))
-            segmentationNode.RemoveClosedSurfaceRepresentation()
-            segmentationNode.CreateClosedSurfaceRepresentation()
-        except Exception:  # noqa: BLE001
-            pass
-
     def _onSmoothingChanged(self, value):
         seg = self.getCurrentSegmentationNode()
         if seg and seg.GetSegmentation().GetNumberOfSegments() > 0:
-            self._applySmoothing(seg, float(value))
+            AirwayExtension.applySurfaceSmoothing(seg, value)
 
     def _createExtensionWidget(self):
-        # Step 2, decoupled from segmentation: extends the currently selected segmentation
+        # Step 3, decoupled from segmentation: extends the currently selected segmentation
         # for flow modelling, so the user can refine the mask first, then extend it.
         widget = qt.QWidget()
         form = qt.QFormLayout(widget)
@@ -277,7 +290,7 @@ class SegmentationWidget(qt.QWidget):
 
         form.addRow(createButton(
             "Run airway extension", callback=self.onRunExtensionClicked, parent=widget,
-            toolTip="Extend the selected segmentation inferiorly by repeating its terminal slice (step 2)."
+            toolTip="Extend the selected segmentation inferiorly by repeating its terminal slice (step 3)."
         ))
         return widget
 
@@ -394,33 +407,200 @@ class SegmentationWidget(qt.QWidget):
         ))
         layout.addWidget(templateBox)
 
-        # Progress across the batch, shown only while a run is in flight.
+        # Progress across the whole batch, shown only while a run is in flight. The same value
+        # is on the bar next to the Stop button, with the case and stage spelled out.
         self.batchProgressBar = qt.QProgressBar(widget)
+        self.batchProgressBar.setRange(0, 1000)
         self.batchProgressBar.setVisible(False)
         layout.addWidget(self.batchProgressBar)
         return widget
 
-    def _onBatchProgress(self, done, total):
-        """Advance the batch progress bar (called once per processed case)."""
-        self.batchProgressBar.setMaximum(max(1, int(total)))
-        self.batchProgressBar.setValue(int(done))
+    def _showProgress(self, snapshot):
+        """Show a progress snapshot (see Progress.RunProgress.snapshot) on the bars and the label."""
+        value = int(round(snapshot["overall_fraction"] * 1000))
+        for bar in (self.runProgressBar, self.batchProgressBar):
+            bar.setRange(0, 1000)
+            bar.setValue(value)
+        self.runStageLabel.setText(Progress.describe(snapshot))
         slicer.app.processEvents()
+
+    def _setProgressVisible(self, isVisible):
+        self.runProgressBar.setVisible(isVisible)
+        self.runStageLabel.setVisible(isVisible)
+        if not isVisible:
+            self._runTracker = None
+
+    def _startRunProgress(self, caseName=""):
+        """Begin tracking a single segmentation; its log lines move the bar from here on."""
+        self._runTracker = Progress.RunProgress(1)
+        self._runTracker.startCase(1, caseName)
+        self._setProgressVisible(True)
+        self._showProgress(self._runTracker.snapshot())
 
     def _createDependenciesWidget(self):
         widget = qt.QWidget()
         form = qt.QFormLayout(widget)
+        self.dependencySummaryLabel = qt.QLabel("", widget)
+        self.dependencySummaryLabel.setWordWrap(True)
+        form.addRow(self.dependencySummaryLabel)
         self.deviceComboBox = qt.QComboBox(widget)
-        for device in ("Auto", "CUDA", "CPU"):
+        for device in ("Auto", "CUDA", "MPS", "CPU"):
             self.deviceComboBox.addItem(device)
-        self.deviceComboBox.setToolTip("Inference device. 'Auto' uses CUDA when available, else CPU.")
+        self.deviceComboBox.setToolTip(
+            "Inference device. 'Auto' uses the NVIDIA GPU (CUDA) when it works, the Apple GPU (MPS) "
+            "on Apple Silicon, and the CPU otherwise."
+        )
         form.addRow("Inference device", self.deviceComboBox)
         buttons = qt.QHBoxLayout()
-        buttons.addWidget(createButton("Check dependencies", callback=self.onCheckDependenciesClicked, parent=widget))
-        buttons.addWidget(createButton("Install / update dependencies", callback=self.onInstallDependenciesClicked, parent=widget))
+        buttons.addWidget(createButton(
+            "Install dependencies", callback=self.onInstallDependenciesClicked, parent=widget,
+            toolTip="Detect the hardware and install everything AUAE needs: the PyTorch build that "
+                    "suits this computer, nnU-Net and the extra packages. A PyTorch that cannot work "
+                    "here is replaced; a working one is left alone.",
+        ))
+        buttons.addWidget(createButton(
+            "Check", callback=self.onCheckDependenciesClicked, parent=widget,
+            toolTip="Print what is installed, what this computer needs and the device inference will use.",
+        ))
         rowWidget = qt.QWidget(widget)
         rowWidget.setLayout(buttons)
         form.addRow(rowWidget)
         return widget
+
+    def _createLlmApiWidget(self):
+        # Opt-in switch for the MCP server (MCP/auae_mcp.py). Off until the user ticks it; the
+        # choice is kept between sessions. The server refuses every request while it is off.
+        widget = qt.QWidget()
+        layout = qt.QVBoxLayout(widget)
+        self.llmApiCheckBox = qt.QCheckBox("Allow an agentic AI to run AUAE", widget)
+        self.llmApiCheckBox.setToolTip(
+            "When ticked, the MCP server shipped with AUAE accepts requests from an agentic AI "
+            "such as Claude or Codex: describing input folders, starting segmentations, reading "
+            "their results. Off by default; the choice is remembered. You are asked to accept a "
+            "disclaimer on patient data before it is switched on."
+        )
+        self.llmApiCheckBox.setChecked(LlmApi.isEnabled())
+        self.llmApiCheckBox.toggled.connect(self._onLlmApiToggled)
+        layout.addWidget(self.llmApiCheckBox)
+
+        LlmApi.syncSettingsFile()
+
+        note = qt.QLabel(
+            "The AI talks to AUAE through the MCP server, a small program that runs on Slicer's "
+            "own Python. AUAE does not anonymise what the AI reads: protecting patient data is the "
+            "responsibility of whoever uses the AI.", widget)
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        layout.addWidget(createButton(
+            "Install MCP server", callback=self.onInstallMcpServerClicked, parent=widget,
+            toolTip="Install the two packages the server needs into their own folder "
+                    "(~/.auae_mcp/site, apart from Slicer's packages), then ask in which AI clients "
+                    "to register the server: Claude Code, Codex, Claude Desktop, Gemini CLI, Cursor. "
+                    "Only the ones you tick are changed.",
+        ))
+        self.llmApiStatusLabel = qt.QLabel("", widget)
+        self.llmApiStatusLabel.setWordWrap(True)
+        layout.addWidget(self.llmApiStatusLabel)
+
+        manual = qt.QLabel("Server command, to register it by hand in any other MCP client:", widget)
+        manual.setWordWrap(True)
+        layout.addWidget(manual)
+        self.llmApiCommandLineEdit = qt.QLineEdit(LlmApi.serverCommandLine(), widget)
+        self.llmApiCommandLineEdit.setReadOnly(True)
+        layout.addWidget(self.llmApiCommandLineEdit)
+        self._updateLlmApiStatus()
+        return widget
+
+    def _updateLlmApiStatus(self):
+        if LlmApi.isServerInstalled():
+            self.llmApiStatusLabel.setText("The MCP server is installed.")
+        else:
+            self.llmApiStatusLabel.setText("The MCP server is not installed yet.")
+
+    def _onLlmApiToggled(self, checked):
+        # Switching the support on means accepting the disclaimer; declining leaves it off.
+        if checked and not slicer.util.confirmYesNoDisplay(
+                LlmApi.DISCLAIMER + "\n\nAllow an agentic AI to run AUAE?",
+                windowTitle="LLM API support"):
+            self.llmApiCheckBox.blockSignals(True)
+            self.llmApiCheckBox.setChecked(False)
+            self.llmApiCheckBox.blockSignals(False)
+            return
+        try:
+            LlmApi.setEnabled(checked)
+        except Exception as exc:  # noqa: BLE001
+            slicer.util.errorDisplay("Could not save the LLM API setting:\n%s" % exc)
+
+    def _buildMcpClientsDialog(self):
+        """Dialog that lists the AI clients and lets the user tick where to register the server.
+
+        Nothing is ticked in advance: a client's configuration is changed only if the user asks
+        for it. Clients that are not installed are listed greyed out.
+        """
+        dialog = qt.QDialog(self)
+        dialog.setWindowTitle("Install MCP server")
+        layout = qt.QVBoxLayout(dialog)
+        intro = qt.QLabel(
+            "The server's packages are installed in any case. Tick the AI clients in which you "
+            "want it registered. Only those are changed; the others are left alone and can be set "
+            "up later, with this button or by hand.", dialog)
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        checkBoxes = {}
+        for label, found in LlmApi.detectClients().items():
+            box = qt.QCheckBox(label if found else label + " (not found on this computer)", dialog)
+            box.setEnabled(found)
+            layout.addWidget(box)
+            checkBoxes[label] = box
+        buttons = qt.QDialogButtonBox(qt.QDialogButtonBox.Ok | qt.QDialogButtonBox.Cancel, dialog)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        return dialog, checkBoxes
+
+    def onInstallMcpServerClicked(self, *_):
+        dialog, checkBoxes = self._buildMcpClientsDialog()
+        if not dialog.exec():
+            return
+        chosen = [label for label, box in checkBoxes.items() if box.checked]
+
+        self.currentInfoTextEdit.clear()
+        self._setApplyVisible(False)
+        slicer.app.setOverrideCursor(qt.Qt.WaitCursor)
+        result = None
+        try:
+            result = LlmApi.setupServer(self.onProgressInfo, chosen)
+        except Exception as exc:  # noqa: BLE001
+            self.onProgressInfo("MCP server installation failed: %s" % exc)
+        finally:
+            slicer.app.restoreOverrideCursor()
+            self._setApplyVisible(True)
+            self._updateLlmApiStatus()
+        if not result or not result["installed"]:
+            slicer.util.warningDisplay("The MCP server could not be installed. The log has the details.")
+            return
+
+        clients = result["clients"]
+        registered = [label for label, state in clients.items() if state]
+        failed = [label for label, state in clients.items() if state is False]
+        message = "The MCP server is installed."
+        if registered:
+            message += "\n\nRegistered with: %s. Restart those that were open." % ", ".join(registered)
+        elif not failed:
+            message += ("\n\nIt was not registered with any AI client. Click the button again to "
+                        "choose one, or register it by hand with the command shown in the panel.")
+        if failed:
+            message += "\n\nRegistration failed for: %s. The log has the details." % ", ".join(failed)
+        if not self.llmApiCheckBox.checked:
+            message += "\n\nThe support is still switched off: tick 'Allow an agentic AI to run AUAE' to let it in."
+        slicer.util.infoDisplay(message)
+
+    def _updateDependencySummary(self):
+        try:
+            self.dependencySummaryLabel.setText(Dependencies.summary())
+        except Exception as exc:  # noqa: BLE001
+            self.dependencySummaryLabel.setText("Hardware detection failed: %s" % exc)
 
     # ------------------------------------------------------------------ lifecycle -----
     def __del__(self):
@@ -486,34 +666,36 @@ class SegmentationWidget(qt.QWidget):
         if not self._dependencyChecker.downloadWeightsIfNeeded(self.onProgressInfo):
             self._setApplyVisible(True)
             return
+        volumeNode = self.getCurrentVolumeNode()
+        self._startRunProgress(volumeNode.GetName() if volumeNode else "")
         self._runSegmentation()
 
     def _setApplyVisible(self, isVisible):
+        if isVisible:
+            self._setProgressVisible(False)  # the run is over, whatever the outcome
         self.applyWidget.setVisible(isVisible)
         self.stopWidget.setVisible(not isVisible)
         self.inputSelector.setEnabled(isVisible)
         self.segmentationNodeSelector.setEnabled(isVisible)
 
     def _ensureReadyToRun(self):
-        """Autonomous preflight: verbose report, GPU/torch conflict guard, then install."""
-        Dependencies.report(self.onProgressInfo)
-        ts = Dependencies.torchStatus()
-        if ts.get("archStatus") == "warn" and self.deviceComboBox.currentText.strip().lower() != "cpu":
-            slicer.util.errorDisplay(
-                "GPU / torch architecture conflict:\n\n" + (ts.get("archMessage") or "") +
-                "\n\nSet 'Inference device: CPU' to run anyway, or install a matching torch build."
-            )
-            return False
-        ok, needsRestart = Dependencies.ensure(self.onProgressInfo, askConfirmation=True)
-        if needsRestart:
-            slicer.util.infoDisplay("The PyTorch extension was installed. Please restart 3D Slicer, then run again.")
-            return False
-        if not ok:
-            slicer.util.errorDisplay(
-                "Dependencies are not ready. Open 'Dependencies && CUDA' and click "
-                "'Install / update dependencies', or check the log."
-            )
-            return False
+        """Preflight before a run: print the report, then install or repair what is missing.
+
+        When everything is in place this costs a fraction of a second. Otherwise the user is
+        asked once, with the list of what will be installed.
+        """
+        if not Dependencies.report(self.onProgressInfo):
+            ok, needsRestart = Dependencies.ensure(self.onProgressInfo, askConfirmation=True, refresh=False)
+            self._updateDependencySummary()
+            if needsRestart:
+                self._offerRestart()
+                return False
+            if not ok:
+                slicer.util.errorDisplay(
+                    "The dependencies are not ready. Open 'Dependencies && CUDA', click "
+                    "'Install dependencies' and check the log."
+                )
+                return False
         if self.logic is None and self.isNNUNetModuleInstalled():
             self.logic = self._createSlicerSegmentationLogic()
             self._connectSegmentationLogic()
@@ -534,15 +716,15 @@ class SegmentationWidget(qt.QWidget):
 
     def _runSegmentation(self):
         deviceChoice = self.deviceComboBox.currentText.strip().lower()
-        cudaAvailable = Dependencies.torchStatus().get("cudaAvailable", False)
-        if deviceChoice != "cpu" and not cudaAvailable:
+        # resolveDevice falls back to 'cpu' when the requested GPU cannot be used.
+        if deviceChoice != "cpu" and Dependencies.resolveDevice(deviceChoice) == "cpu":
             ret = qt.QMessageBox.question(
                 self,
-                "CUDA not available",
-                "CUDA is not currently available on your system.\n"
-                "Running the segmentation may take up to 1 hour on CPU.\n"
-                "You can install a CUDA build from 'Dependencies && CUDA'.\n"
-                "Would you like to proceed on CPU?",
+                "No usable GPU",
+                "PyTorch cannot use a GPU on this computer right now.\n"
+                "The segmentation will run on the CPU and may take up to 1 hour.\n"
+                "'Dependencies && CUDA' shows why and what can be installed.\n"
+                "Would you like to proceed on the CPU?",
             )
             if ret == qt.QMessageBox.No:
                 self._setApplyVisible(True)
@@ -648,7 +830,6 @@ class SegmentationWidget(qt.QWidget):
 
     def _collectExtensionOptions(self):
         return {
-            "direction": AirwayExtension.EXTENSION_DIRECTIONS[0],  # always inferior (neck)
             "lengthMm": float(self.extendLengthSpinBox.value),
             "smoothingFactor": float(self.smoothingSlider.value),
         }
@@ -665,12 +846,13 @@ class SegmentationWidget(qt.QWidget):
         if not segmentationNode:
             return
         self._initializeSegmentationNodeDisplay(segmentationNode)
-        # Apply the user-chosen surface smoothing factor (0 = raw voxel surface).
-        self._applySmoothing(segmentationNode, float(self.smoothingSlider.value))
+        # Apply the user-chosen surface smoothing factor (0 = raw voxel surface). A no-op when
+        # the post-processing already built the surface with this factor.
+        AirwayExtension.applySurfaceSmoothing(segmentationNode, self.smoothingSlider.value)
         slicer.util.resetThreeDViews()
 
     def onRunExtensionClicked(self):
-        """Step 2: extend the currently selected segmentation, in place."""
+        """Step 3: extend the currently selected segmentation, in place."""
         segmentationNode = self.getCurrentSegmentationNode()
         if not segmentationNode:
             slicer.util.warningDisplay("Select a segmentation to extend first.")
@@ -697,6 +879,9 @@ class SegmentationWidget(qt.QWidget):
         self.currentInfoTextEdit.insertPlainText(infoMsg + "\n")
         self.moveTextEditToEnd(self.currentInfoTextEdit)
         self.insertDatedInfoLogs(infoMsg)
+        # A single run is tracked here; a batch reports through BatchProcessor's onStage.
+        if self._runTracker is not None and self._runTracker.update(infoMsg):
+            self._showProgress(self._runTracker.snapshot())
         slicer.app.processEvents()
 
     @staticmethod
@@ -765,7 +950,7 @@ class SegmentationWidget(qt.QWidget):
             return
 
         folderPath = qt.QFileDialog.getExistingDirectory(
-            self, "Please select the export folder", getattr(self, "_lastExportFolder", "")
+            self, "Please select the export folder", self._lastExportFolder
         )
         if not folderPath:
             return
@@ -816,8 +1001,9 @@ class SegmentationWidget(qt.QWidget):
                     )
             for labelExt, labelFormat in (("nii.gz", ExportFormat.NIFTI), ("nrrd", ExportFormat.NRRD)):
                 if selectedFormats & labelFormat:
+                    # useCompression=True: a binary mask compresses from hundreds of MB to a few.
                     logic.ExportSegmentsBinaryLabelmapRepresentationToFiles(
-                        folderPath, segmentationNode, segmentIds, labelExt,
+                        folderPath, segmentationNode, segmentIds, labelExt, True,
                     )
 
     # ------------------------------------------------------------------ post-processing
@@ -843,28 +1029,49 @@ class SegmentationWidget(qt.QWidget):
         except Exception as exc:  # noqa: BLE001
             slicer.util.errorDisplay("Dependency check failed:\n" + str(exc))
             return
+        self._updateDependencySummary()
         if ready:
             slicer.util.infoDisplay("All dependencies are present and the extension is ready to run.")
         else:
             slicer.util.warningDisplay(
-                "Some dependencies are missing. Click 'Install / update dependencies'. See the log for details."
+                "Something is missing or does not suit this computer. Click 'Install dependencies'. "
+                "The log has the details."
             )
 
-    def onInstallDependenciesClicked(self):
+    def onInstallDependenciesClicked(self, *_):
+        self._installDependencies(askConfirmation=True)
+
+    def _resumeDependencyInstall(self):
+        """Continue an installation that had to wait for a restart. The user already agreed."""
+        self.onProgressInfo("Continuing the dependency installation after the restart...")
+        self._installDependencies(askConfirmation=False)
+
+    def _installDependencies(self, askConfirmation):
         self.currentInfoTextEdit.clear()
         self._setApplyVisible(False)
+        slicer.app.setOverrideCursor(qt.Qt.WaitCursor)
+        ok, needsRestart = False, False
         try:
-            ok, needsRestart = Dependencies.ensure(self.onProgressInfo, askConfirmation=True)
-            if needsRestart:
-                slicer.util.infoDisplay("The PyTorch extension was installed. Please restart 3D Slicer, then continue.")
-            elif ok:
-                slicer.util.infoDisplay("Dependencies installed/validated. Restart Slicer if torch was newly installed.")
-            else:
-                slicer.util.warningDisplay("Dependency setup did not fully complete. See the log.")
+            ok, needsRestart = Dependencies.ensure(self.onProgressInfo, askConfirmation=askConfirmation)
         except Exception as exc:  # noqa: BLE001
-            slicer.util.errorDisplay("Dependency install failed:\n" + str(exc))
+            self.onProgressInfo("Dependency install failed: %s" % exc)
         finally:
+            slicer.app.restoreOverrideCursor()
             self._setApplyVisible(True)
+            self._updateDependencySummary()
+        if needsRestart:
+            self._offerRestart()
+        elif ok:
+            slicer.util.infoDisplay("The dependencies are installed and AUAE is ready to run.\n\n"
+                                    + Dependencies.summary())
+        else:
+            slicer.util.warningDisplay("The dependency setup did not complete. The log has the details.")
+
+    def _offerRestart(self):
+        if slicer.util.confirmYesNoDisplay(
+                "3D Slicer must be restarted to continue the installation. "
+                "It picks up by itself when AUAE opens again.\n\nRestart now?"):
+            slicer.util.restart()
 
     # ------------------------------------------------------------------ batch ---
     def onBrowseTemplate(self):
@@ -894,7 +1101,7 @@ class SegmentationWidget(qt.QWidget):
             return
         exportFormats = self.getSelectedExportFormats()
         if not exportFormats:
-            slicer.util.warningDisplay("Select at least one export format (STL / OBJ / NIFTI).")
+            slicer.util.warningDisplay("Select at least one export format (STL / OBJ / NIFTI / NRRD).")
             return
         config = BatchProcessorLib.folderConfig(
             inputFolder, self.batchOutputFolderLineEdit.text.strip(),
@@ -931,9 +1138,9 @@ class SegmentationWidget(qt.QWidget):
         """Shared batch driver for both folder-in/folder-out and template runs."""
         self.currentInfoTextEdit.clear()
         self._setApplyVisible(False)
-        self.batchProgressBar.setValue(0)
-        self.batchProgressBar.setMaximum(max(1, len(config.get("volumes", []))))
+        self._setProgressVisible(True)
         self.batchProgressBar.setVisible(True)
+        self._showProgress(Progress.RunProgress(len(config.get("volumes", []))).snapshot())
         try:
             if not self._ensureReadyToRun():
                 return
@@ -944,7 +1151,7 @@ class SegmentationWidget(qt.QWidget):
                 self.nnUnetFolder(), self.exportSegmentation, self.onProgressInfo
             )
             results = processor.run(config, exportFormats, deviceKwargs=deviceKwargs,
-                                    onProgress=self._onBatchProgress)
+                                    onStage=self._showProgress)
         except Exception as exc:  # noqa: BLE001
             slicer.util.errorDisplay("Batch processing failed:\n" + str(exc))
             return

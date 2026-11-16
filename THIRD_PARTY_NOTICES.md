@@ -9,7 +9,9 @@ This extension is based on, and depends on, the following third-party components
   Isensee et al., Nature Methods 2021.
 - **SlicerNNUNet** (`NNUNet` Slicer extension): provides `SlicerNNUNetLib` used for inference.
 - **3D Slicer**: BSD-style Slicer license. https://slicer.org
-- **PyGithub**, **SciPy**, **NumPy**, **light-the-torch**, **PyTorch**: respective OSS licenses.
+- **PyGithub**, **SciPy**, **NumPy**, **PyTorch**: respective OSS licenses.
+- **MCP Python SDK** (`mcp`) and **pydicom**: used only by the optional MCP server; respective
+  OSS licenses (MIT).
 
 The bundled model weights are downloaded at runtime from the upstream project's GitHub
 releases and remain subject to the upstream project's terms.

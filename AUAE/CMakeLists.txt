@@ -7,17 +7,17 @@ set(MODULE_PYTHON_SCRIPTS
   ${MODULE_NAME}Lib/__init__.py
   ${MODULE_NAME}Lib/AirwayExtension.py
   ${MODULE_NAME}Lib/BatchProcessor.py
-  ${MODULE_NAME}Lib/CudaSupport.py
   ${MODULE_NAME}Lib/Dependencies.py
   ${MODULE_NAME}Lib/IconPath.py
+  ${MODULE_NAME}Lib/LlmApi.py
+  ${MODULE_NAME}Lib/Progress.py
   ${MODULE_NAME}Lib/PythonDependencyChecker.py
   ${MODULE_NAME}Lib/SegmentationWidget.py
-  ${MODULE_NAME}Lib/Signal.py
   ${MODULE_NAME}Lib/Utils.py
-  Testing/__init__.py
-  Testing/IntegrationTestCase.py
-  Testing/SegmentationWidgetTestCase.py
-  Testing/Utils.py
+  CLI/auae_batch.py
+  Testing/AirwayExtensionTestCase.py
+  Testing/DependenciesTestCase.py
+  Testing/ProgressTestCase.py
   )
 
 set(MODULE_PYTHON_RESOURCES
@@ -27,7 +27,6 @@ set(MODULE_PYTHON_RESOURCES
   Resources/Icons/loading.gif
   Resources/Icons/start_icon.png
   Resources/batch_template.json
-  Testing/Data/UpperAirway_Segmentation.nii.gz
   )
 
 #-----------------------------------------------------------------------------

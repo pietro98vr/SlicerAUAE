@@ -45,6 +45,20 @@ class AUAE(ScriptedLoadableModule):
             "(Gianoni-Capenakas et al., Journal of Dentistry 2026) and nnU-Net "
             "(Isensee et al., Nature Methods 2021)."
         )
+        slicer.app.connect("startupCompleted()", self._resumePendingInstall)
+
+    @staticmethod
+    def _resumePendingInstall():
+        """Reopen the module after a restart requested by the dependency installation.
+
+        The panel then continues the installation by itself (see SegmentationWidget).
+        """
+        try:
+            from AUAELib import Dependencies
+            if Dependencies.isResumePending() and slicer.util.mainWindow() is not None:
+                slicer.util.selectModule("AUAE")
+        except Exception:  # noqa: BLE001
+            pass
 
 
 class AUAEWidget(ScriptedLoadableModuleWidget):

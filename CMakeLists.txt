@@ -9,7 +9,7 @@ project(AUAE)
 set(EXTENSION_HOMEPAGE "https://github.com/pietro98vr/SlicerAUAE")
 set(EXTENSION_CATEGORY "Segmentation")
 set(EXTENSION_CONTRIBUTORS "Alejandro Matos Camarillo (uAlberta), Silvia Capenakas (uAlberta), Manuel Lagravere (uAlberta), Pietro Montagna (University of Verona), Fabio Lonardi (University of Verona)")
-set(EXTENSION_DESCRIPTION "Based on UpperAirwaySegmentator: fully automatic upper-airway CT/CBCT nnU-Net segmentation, plus airway extension for flow modelling, JSON-driven batch processing with per-volume output subfolders, mutually-exclusive island cleanup, and an autonomous CUDA-aware dependency preflight. The embedded Segment Editor is removed; upstream STL/OBJ/NIFTI export is kept.")
+set(EXTENSION_DESCRIPTION "Based on UpperAirwaySegmentator: fully automatic upper-airway CT/CBCT nnU-Net segmentation, plus island cleanup, paranasal sinus recovery, an optional external face-air segment and an inferior airway extension for flow modelling, an embedded Segment Editor for manual refinement, STL/OBJ/NIFTI/NRRD export, folder or JSON batch processing with per-case output subfolders, a headless command-line runner, and a CUDA-aware dependency preflight.")
 set(EXTENSION_DEPENDS "NNUNet") # NNUNet transitively installs the PyTorch extension (CUDA torch)
 
 #-----------------------------------------------------------------------------

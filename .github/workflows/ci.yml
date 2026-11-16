@@ -18,6 +18,9 @@ jobs:
         run: |
           python -m py_compile \
             AUAE/AUAE.py \
-            AUAE/AUAELib/*.py
+            AUAE/AUAELib/*.py \
+            AUAE/CLI/*.py \
+            AUAE/Testing/*.py \
+            MCP/*.py
       - name: Validate the batch template
         run: python -c "import json; json.load(open('AUAE/Resources/batch_template.json'))"

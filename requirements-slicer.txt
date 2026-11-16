@@ -1,6 +1,6 @@
-# Python packages used by this project inside Slicer's Python environment.
-# torch and nnunetv2 are installed by the NNUNet Slicer extension (SlicerNNUNetLib) or by
-# the project's "CUDA / PyTorch setup" section, so they are intentionally NOT pinned here.
+# Python packages AUAE uses inside Slicer's own Python (not the Python of your system).
+# "Install dependencies" in the module installs them; this file is a reference.
+# torch and nnunetv2 are installed there too, in the build that suits the GPU, so they are
+# intentionally NOT pinned here.
 PyGithub          # upstream weight download (github API)
-scipy             # island cleanup + airway extension
-light-the-torch   # optional: CUDA-aware torch install helper
+scipy             # connected components and morphology in the post-processing

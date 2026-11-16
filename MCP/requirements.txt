@@ -1,0 +1,6 @@
+# Packages of the MCP server. "Install MCP server" in the AUAE panel installs them with Slicer's
+# Python into ~/.auae_mcp/site, so this file is only needed to run the server on a Python of
+# your own (3.10 or newer, in a virtual environment). Do not install them into Slicer's
+# site-packages or into your main Python.
+mcp       # Model Context Protocol SDK (the server itself)
+pydicom   # optional: lets describe_inputs read DICOM headers
